@@ -13,12 +13,15 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -87,10 +90,14 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
-    @WithMockUser(roles = "USER")
     @DisplayName("REST: 200 с ролью USER")
     void shouldReturn200WithUserRole() throws Exception {
-        mockMvc.perform(get("/api/orders/stock"))
+        mockMvc.perform(get("/api/orders/stock")
+                        .with(jwt()
+                                .jwt(token -> token
+                                        .subject("client-123")
+                                        .claim("realm_access", Map.of("roles", List.of("USER"))))
+                                .authorities(new SimpleGrantedAuthority("ROLE_USER"))))
                 .andExpect(status().isOk());
     }
 
