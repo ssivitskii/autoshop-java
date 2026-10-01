@@ -8,20 +8,15 @@ import dealership.storage.core.application.service.AssemblyOrderService;
 import dealership.storage.core.domain.entity.assembly.AssemblyOrder;
 import dealership.storage.core.domain.entity.car.Car;
 import dealership.storage.core.domain.enums.*;
-import org.apache.kafka.clients.producer.ProducerConfig;
-import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
-import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.math.BigDecimal;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -46,6 +41,9 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
 
     @Autowired
     private ObjectMapper objectMapper;
+
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
 
     @Test
     @DisplayName("Liquibase миграции: таблицы и seed data")
@@ -88,15 +86,7 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
         event.setTraceId(traceId);
         event.setCarId("car-123");
 
-        Map<String, Object> props = new HashMap<>();
-        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafka.getBootstrapServers());
-        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
-
-        KafkaTemplate<String, String> testProducer = new KafkaTemplate<>(
-                new DefaultKafkaProducerFactory<>(props));
-
-        testProducer.send("order.events", orderId, objectMapper.writeValueAsString(event)).get();
+        kafkaTemplate.send("order.events", orderId, objectMapper.writeValueAsString(event)).get();
 
         Thread.sleep(5000);
 
