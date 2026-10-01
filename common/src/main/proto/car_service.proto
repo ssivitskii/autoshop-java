@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package dealership.grpc;
+
+option java_multiple_files = true;
+option java_package = "dealership.common.grpc";
+option java_outer_classname = "CarServiceProto";
+
+service CarGrpcService {
+  rpc GetAvailableCars (GetAvailableCarsRequest) returns (GetAvailableCarsResponse);
+  rpc GetCarById (GetCarByIdRequest) returns (CarDto);
+}
+
+message GetAvailableCarsRequest {
+}
+
+message GetAvailableCarsResponse {
+  repeated CarDto cars = 1;
+}
+
+message GetCarByIdRequest {
+  string id = 1;
+}
+
+message CarDto {
+  string id = 1;
+  string brand = 2;
+  string model_name = 3;
+  string body_type = 4;
+  string fuel_type = 5;
+  int32 engine_power_hp = 6;
+  double engine_volume_liters = 7;
+  string transmission_type = 8;
+  string drive_type = 9;
+  string color = 10;
+  string price = 11;
+  bool available = 12;
+  bool available_for_test_drive = 13;
+}

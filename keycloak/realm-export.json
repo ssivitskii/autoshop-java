@@ -1,0 +1,147 @@
+{
+  "realm": "dealership",
+  "enabled": true,
+  "registrationAllowed": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "USER",
+        "description": "Клиент автосалона"
+      },
+      {
+        "name": "MANAGER",
+        "description": "Менеджер автосалона"
+      },
+      {
+        "name": "WAREHOUSE_ADMIN",
+        "description": "Администратор склада"
+      },
+      {
+        "name": "ADMIN",
+        "description": "Администратор системы"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "dealership-app",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "redirectUris": [
+        "http://localhost:8080/*"
+      ],
+      "webOrigins": [
+        "http://localhost:8080"
+      ],
+      "protocol": "openid-connect",
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      },
+      "protocolMappers": [
+        {
+          "name": "realm-roles-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "userinfo.token.claim": "true",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "client1",
+      "enabled": true,
+      "email": "client1@dealership.com",
+      "firstName": "Иван",
+      "lastName": "Петров",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "USER"
+      ]
+    },
+    {
+      "username": "client2",
+      "enabled": true,
+      "email": "client2@dealership.com",
+      "firstName": "Пётр",
+      "lastName": "Сидоров",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "USER"
+      ]
+    },
+    {
+      "username": "manager1",
+      "enabled": true,
+      "email": "manager1@dealership.com",
+      "firstName": "Мария",
+      "lastName": "Сидорова",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "MANAGER"
+      ]
+    },
+    {
+      "username": "warehouse1",
+      "enabled": true,
+      "email": "warehouse1@dealership.com",
+      "firstName": "Алексей",
+      "lastName": "Козлов",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "WAREHOUSE_ADMIN"
+      ]
+    },
+    {
+      "username": "admin1",
+      "enabled": true,
+      "email": "admin1@dealership.com",
+      "firstName": "Системный",
+      "lastName": "Администратор",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "password",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "ADMIN"
+      ]
+    }
+  ]
+}

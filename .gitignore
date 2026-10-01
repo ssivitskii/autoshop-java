@@ -1,0 +1,60 @@
+# Gradle and Java build output
+.gradle/
+/build/
+/*/build/
+/out/
+/*/out/
+/bin/
+/*/bin/
+/target/
+/*/target/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDEs
+.idea/
+*.iws
+*.iml
+*.ipr
+.vscode/
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache/
+.apt_generated/
+nbproject/private/
+nbbuild/
+dist/
+nbdist/
+.nb-gradle/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+application-local.yml
+application-local.yaml
+application-local.properties
+application-secrets.yml
+application-secrets.yaml
+application-secrets.properties
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.hprof
+
+# Operating systems
+.DS_Store
+Thumbs.db
