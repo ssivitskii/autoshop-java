@@ -31,14 +31,21 @@ spring:
     bootstrap-servers: localhost:9092
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 5000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
     consumer:
       group-id: storage-service
       auto-offset-reset: earliest
+      enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "dealership.common.event"
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
 
 jwt:
   auth:
@@ -54,6 +61,15 @@ springdoc:
 
 server:
   port: 8082
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
 grpc:
   server:
     address: 127.0.0.1
@@ -64,3 +80,10 @@ reservation:
   recovery:
     interval: PT10S
     batch-size: 100
+
+outbox:
+  publisher:
+    interval: PT1S
+    batch-size: 100
+    claim-duration: PT30S
+    send-timeout: PT10S

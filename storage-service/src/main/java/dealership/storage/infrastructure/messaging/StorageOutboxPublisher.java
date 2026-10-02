@@ -1,4 +1,4 @@
-package dealership.order.infrastructure.messaging;
+package dealership.storage.infrastructure.messaging;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,24 +14,23 @@ import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
 @Component
-public class OutboxPublisher {
+public class StorageOutboxPublisher {
+    private static final Logger log = LoggerFactory.getLogger(StorageOutboxPublisher.class);
+    private static final String TOPIC = "order.responses";
 
-    private static final Logger log = LoggerFactory.getLogger(OutboxPublisher.class);
-    private static final String TOPIC = "order.events";
-
-    private final OutboxClaimStore claimStore;
+    private final StorageOutboxClaimStore claimStore;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
     private final int batchSize;
     private final Duration claimDuration;
     private final Duration sendTimeout;
 
-    public OutboxPublisher(OutboxClaimStore claimStore,
-                           KafkaTemplate<String, String> kafkaTemplate,
-                           ObjectMapper objectMapper,
-                           @Value("${outbox.publisher.batch-size:100}") int batchSize,
-                           @Value("${outbox.publisher.claim-duration:PT30S}") Duration claimDuration,
-                           @Value("${outbox.publisher.send-timeout:PT10S}") Duration sendTimeout) {
+    public StorageOutboxPublisher(StorageOutboxClaimStore claimStore,
+                                  KafkaTemplate<String, String> kafkaTemplate,
+                                  ObjectMapper objectMapper,
+                                  @Value("${outbox.publisher.batch-size:100}") int batchSize,
+                                  @Value("${outbox.publisher.claim-duration:PT30S}") Duration claimDuration,
+                                  @Value("${outbox.publisher.send-timeout:PT10S}") Duration sendTimeout) {
         this.claimStore = claimStore;
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
@@ -51,7 +50,7 @@ public class OutboxPublisher {
         }
     }
 
-    private void publish(OutboxClaimStore.ClaimedEvent event) {
+    private void publish(StorageOutboxClaimStore.ClaimedEvent event) {
         try {
             JsonNode payload = objectMapper.readTree(event.payload());
             EventEnvelope<JsonNode> envelope = new EventEnvelope<>(
@@ -61,18 +60,18 @@ public class OutboxPublisher {
             kafkaTemplate.send(TOPIC, event.aggregateId(), message)
                     .get(sendTimeout.toMillis(), TimeUnit.MILLISECONDS);
             if (claimStore.markSent(event.id(), event.claimToken())) {
-                log.info("Published outbox event: type={}, aggregateId={}, eventId={}",
+                log.info("Published storage response: type={}, aggregateId={}, eventId={}",
                         event.eventType(), event.aggregateId(), event.id());
             } else {
-                log.warn("Broker acknowledged event {}, but its database lease is no longer current", event.id());
+                log.warn("Broker acknowledged response {}, but its database lease is no longer current", event.id());
             }
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             claimStore.markFailed(event.id(), event.claimToken(), event.attemptCount());
-            log.warn("Interrupted while publishing outbox event {}", event.id());
+            log.warn("Interrupted while publishing storage response {}", event.id());
         } catch (Exception exception) {
             claimStore.markFailed(event.id(), event.claimToken(), event.attemptCount());
-            log.warn("Failed to publish outbox event {}; it remains pending", event.id(), exception);
+            log.warn("Failed to publish storage response {}; it remains pending", event.id(), exception);
         }
     }
 }

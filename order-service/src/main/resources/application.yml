@@ -31,14 +31,21 @@ spring:
     bootstrap-servers: localhost:9092
     producer:
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
-      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      acks: all
+      properties:
+        enable.idempotence: true
+        max.block.ms: 5000
+        request.timeout.ms: 5000
+        delivery.timeout.ms: 10000
     consumer:
       group-id: order-service
       auto-offset-reset: earliest
+      enable-auto-commit: false
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
-      properties:
-        spring.json.trusted.packages: "dealership.common.event"
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    listener:
+      ack-mode: record
 
 jwt:
   auth:
@@ -55,9 +62,21 @@ springdoc:
 server:
   port: 8081
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
 outbox:
-  scheduler:
-    rate: 5000
+  publisher:
+    interval: PT1S
+    batch-size: 100
+    claim-duration: PT30S
+    send-timeout: PT10S
 reservation:
   recovery:
     interval: PT10S
@@ -65,6 +84,6 @@ reservation:
 grpc:
   client:
     storage-service:
-      address: static://localhost:9090
+      address: ${STORAGE_GRPC_ADDRESS:static://localhost:9090}
       negotiation-type: plaintext
       deadline-after: 5000

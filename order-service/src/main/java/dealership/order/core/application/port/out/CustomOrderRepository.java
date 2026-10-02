@@ -9,6 +9,8 @@ public interface CustomOrderRepository {
 
     CustomOrder findById(String id);
 
+    CustomOrder findByIdForUpdate(String id);
+
     List<CustomOrder> findAll();
 
     List<CustomOrder> findByClientId(String clientId);

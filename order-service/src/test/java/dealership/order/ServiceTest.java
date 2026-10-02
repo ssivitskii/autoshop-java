@@ -333,7 +333,7 @@ class ServiceTest {
             order.advanceStatus(null);
             order.advanceStatus(null);
 
-            when(orderRepository.findById(order.getId())).thenReturn(order);
+            when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
             when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
 
             CustomOrder advanced = customOrderService.advanceOrder(order.getId());
