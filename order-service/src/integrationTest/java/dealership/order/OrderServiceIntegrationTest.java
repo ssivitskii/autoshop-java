@@ -5,17 +5,24 @@ import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.application.service.StockOrderService;
 import dealership.order.core.application.service.StockReservationRecoveryService;
 import dealership.order.core.application.service.CustomOrderService;
+import dealership.order.core.application.service.TestDriveService;
 import dealership.order.core.application.port.out.CustomOrderRepository;
+import dealership.order.core.application.port.out.CustomConfigurationGateway;
+import dealership.order.core.application.port.out.TestDriveCarGateway;
+import dealership.order.core.application.port.out.TestDriveRequestRepository;
 import dealership.order.core.domain.entity.car.CarConfiguration;
 import dealership.order.core.domain.entity.order.CustomOrder;
 import dealership.order.core.domain.enums.CustomOrderStatus;
 import dealership.order.core.domain.entity.order.StockOrder;
+import dealership.order.core.domain.entity.testdrive.TestDriveRequest;
 import dealership.order.core.domain.entity.user.User;
 import dealership.order.core.domain.enums.StockOrderStatus;
+import dealership.order.core.domain.enums.TestDriveStatus;
 import dealership.order.core.domain.enums.UserRole;
 import dealership.order.core.domain.exception.StorageUnavailableException;
 import dealership.order.core.domain.exception.DomainValidationException;
 import dealership.order.core.domain.exception.EntityNotFoundException;
+import dealership.order.core.domain.exception.TestDriveConflictException;
 import dealership.order.infrastructure.grpc.CarGrpcClient;
 import dealership.order.infrastructure.messaging.OutboxEvent;
 import dealership.order.infrastructure.messaging.OutboxRepository;
@@ -40,8 +47,14 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.time.Instant;
 import java.time.Duration;
+import java.time.LocalDateTime;
 import java.math.BigDecimal;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.doAnswer;
@@ -51,6 +64,7 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -92,6 +106,12 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     @Autowired
     private CustomOrderRepository customOrderRepository;
 
+    @Autowired
+    private TestDriveService testDriveService;
+
+    @Autowired
+    private TestDriveRequestRepository testDriveRequestRepository;
+
     // Boundary test: storage reservation behavior is covered against real PostgreSQL
     // in storage-service; order integration tests isolate the remote gRPC dependency.
     @MockBean
@@ -102,6 +122,13 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
         when(reservationGateway.reserve(anyString(), anyString()))
                 .thenReturn(new dealership.order.core.application.port.out.StockCarReservationGateway.ReservationLease(
                         Instant.now().plusSeconds(900)));
+        when(reservationGateway.quote(anyString(), any())).thenAnswer(invocation ->
+                new CustomConfigurationGateway.ConfigurationQuote(
+                        invocation.getArgument(0), invocation.getArgument(1),
+                        new BigDecimal("3500000.00")));
+        when(reservationGateway.get(anyString())).thenAnswer(invocation ->
+                new TestDriveCarGateway.TestDriveCar(
+                        UUID.fromString(invocation.getArgument(0)).toString(), true, true));
     }
 
     @Test
@@ -161,9 +188,9 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     @Test
     @DisplayName("Custom approval использует блокировку и повтор не продвигает заказ дважды")
     void shouldApplyCustomApprovalExactlyOnceByState() {
-        CarConfiguration configuration = new CarConfiguration(UUID.randomUUID().toString());
+        String modelId = UUID.randomUUID().toString();
         CustomOrder order = customOrderService.createOrder(
-                "custom-client", UUID.randomUUID().toString(), configuration, new BigDecimal("1000000"));
+                "custom-client", modelId, Map.of());
         customOrderService.advanceOrder(order.getId());
         customOrderService.advanceOrder(order.getId());
         customOrderService.advanceOrder(order.getId());
@@ -331,6 +358,127 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
+    @DisplayName("Test-drive exclusion: adjacent and different cars are allowed, overlap is 409")
+    void shouldEnforceOneHourHalfOpenTestDriveWindow() {
+        String carId = UUID.randomUUID().toString();
+        String otherCarId = UUID.randomUUID().toString();
+        LocalDateTime start = LocalDateTime.of(2099, 1, 10, 10, 0);
+
+        testDriveService.createRequest("client-a", carId, start);
+        testDriveService.createRequest("client-b", carId, start.plusHours(1));
+        testDriveService.createRequest("client-c", otherCarId, start.plusMinutes(30));
+
+        assertThrows(TestDriveConflictException.class,
+                () -> testDriveService.createRequest("client-d", carId, start.plusMinutes(30)));
+    }
+
+    @Test
+    @DisplayName("Cancelled, completed and removed test-drives do not block a new booking")
+    void shouldIgnoreInactiveTestDrivesForOverlap() {
+        String carId = UUID.randomUUID().toString();
+        LocalDateTime start = LocalDateTime.of(2099, 2, 10, 10, 0);
+
+        TestDriveRequest cancelled = testDriveRequestRepository.save(
+                new TestDriveRequest("cancelled", carId, start));
+        jdbcTemplate.update("UPDATE test_drive_requests SET status = 'CANCELLED' WHERE id = ?",
+                UUID.fromString(cancelled.getId()));
+        TestDriveRequest completed = testDriveRequestRepository.save(
+                new TestDriveRequest("completed", carId, start));
+        jdbcTemplate.update("UPDATE test_drive_requests SET status = 'COMPLETED' WHERE id = ?",
+                UUID.fromString(completed.getId()));
+        TestDriveRequest removed = testDriveRequestRepository.save(
+                new TestDriveRequest("removed", carId, start));
+        jdbcTemplate.update("UPDATE test_drive_requests SET removed = TRUE WHERE id = ?",
+                UUID.fromString(removed.getId()));
+
+        assertDoesNotThrow(() -> testDriveService.createRequest("active", carId, start));
+    }
+
+    @Test
+    @DisplayName("UUID aliases cannot bypass overlap exclusion")
+    void shouldTreatUuidAliasesAsSameCar() {
+        String canonicalCarId = UUID.randomUUID().toString();
+        LocalDateTime start = LocalDateTime.of(2099, 3, 10, 10, 0);
+        testDriveRequestRepository.save(
+                new TestDriveRequest("client-a", canonicalCarId.toUpperCase(), start));
+
+        assertThrows(TestDriveConflictException.class, () -> testDriveRequestRepository.save(
+                new TestDriveRequest("client-b", canonicalCarId, start.plusMinutes(15))));
+    }
+
+    @Test
+    @DisplayName("Два конкурентных пересекающихся test-drive дают ровно одного победителя")
+    void shouldAllowExactlyOneConcurrentTestDrive() throws Exception {
+        String carId = UUID.randomUUID().toString();
+        LocalDateTime start = LocalDateTime.of(2099, 4, 10, 10, 0);
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch release = new CountDownLatch(1);
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<Boolean> first = executor.submit(() -> tryCreateTestDrive(
+                    "client-a", carId, start, ready, release));
+            Future<Boolean> second = executor.submit(() -> tryCreateTestDrive(
+                    "client-b", carId, start.plusMinutes(30), ready, release));
+            try {
+                assertTrue(ready.await(10, TimeUnit.SECONDS));
+            } finally {
+                release.countDown();
+            }
+            assertEquals(1, (first.get(10, TimeUnit.SECONDS) ? 1 : 0)
+                    + (second.get(10, TimeUnit.SECONDS) ? 1 : 0));
+        }
+    }
+
+    @Test
+    @DisplayName("REST custom order ignores forged price and test-drive reports validation statuses")
+    void shouldUseServerPriceAndExposeTestDriveStatuses() throws Exception {
+        userRepository.save(new User(
+                "mgr-http", "pass", "Manager HTTP", "http-manager@test.com", "+7099", UserRole.MANAGER));
+        String modelId = UUID.randomUUID().toString();
+        String carId = UUID.randomUUID().toString();
+        LocalDateTime start = LocalDateTime.of(2099, 5, 10, 10, 0);
+
+        mockMvc.perform(post("/api/orders/custom")
+                        .with(userJwt("http-client"))
+                        .contentType("application/json")
+                        .content("""
+                                {"carModelId":"%s","selectedVariants":{},"totalPrice":0.01}
+                                """.formatted(modelId)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.clientId").value("http-client"))
+                .andExpect(jsonPath("$.totalPrice").value(3500000.00));
+
+        mockMvc.perform(post("/api/test-drives")
+                        .with(userJwt("http-client"))
+                        .contentType("application/json")
+                        .content("""
+                                {"carId":"%s","scheduledAt":"%s"}
+                                """.formatted(carId, start)))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post("/api/test-drives")
+                        .with(userJwt("http-client"))
+                        .contentType("application/json")
+                        .content("""
+                                {"carId":"%s","scheduledAt":"%s"}
+                                """.formatted(carId, start.plusMinutes(30))))
+                .andExpect(status().isConflict());
+        mockMvc.perform(post("/api/test-drives")
+                        .with(userJwt("http-client"))
+                        .contentType("application/json")
+                        .content("{"))
+                .andExpect(status().isBadRequest());
+
+        when(reservationGateway.get(anyString())).thenThrow(new EntityNotFoundException("missing"));
+        mockMvc.perform(post("/api/test-drives")
+                        .with(userJwt("http-client"))
+                        .contentType("application/json")
+                        .content("""
+                                {"carId":"%s","scheduledAt":"%s"}
+                                """.formatted(UUID.randomUUID(), start.plusDays(1))))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
     @DisplayName("REST: 401 без токена")
     void shouldReturn401WithoutToken() throws Exception {
         mockMvc.perform(get("/api/orders/stock"))
@@ -366,5 +514,26 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     private int inboxCount(UUID eventId) {
         return jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM inbox_events WHERE event_id = ?", Integer.class, eventId);
+    }
+
+    private boolean tryCreateTestDrive(String clientId, String carId, LocalDateTime start,
+                                       CountDownLatch ready, CountDownLatch release) throws Exception {
+        ready.countDown();
+        if (!release.await(10, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("Concurrent test-drive start timed out");
+        }
+        try {
+            testDriveService.createRequest(clientId, carId, start);
+            return true;
+        } catch (TestDriveConflictException expected) {
+            return false;
+        }
+    }
+
+    private org.springframework.test.web.servlet.request.RequestPostProcessor userJwt(String subject) {
+        return jwt()
+                .jwt(token -> token.subject(subject)
+                        .claim("realm_access", Map.of("roles", List.of("USER"))))
+                .authorities(new SimpleGrantedAuthority("ROLE_USER"));
     }
 }

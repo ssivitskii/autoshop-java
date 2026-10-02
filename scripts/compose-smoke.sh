@@ -5,6 +5,7 @@ readonly ORDER_URL="http://127.0.0.1:8081"
 readonly KEYCLOAK_URL="http://127.0.0.1:8180"
 readonly CAR_ONE="e0000000-0000-0000-0000-000000000001"
 readonly CAR_TWO="e0000000-0000-0000-0000-000000000002"
+readonly MODEL_320="b0000000-0000-0000-0000-000000000001"
 
 token() {
   curl --fail --silent --show-error \
@@ -25,6 +26,13 @@ request() {
     curl --fail --silent --show-error -X "$method" "${ORDER_URL}${path}" \
       -H "Authorization: Bearer ${bearer}"
   fi
+}
+
+status_code() {
+  local method="$1" path="$2" bearer="$3" body="$4"
+  curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    -X "$method" "${ORDER_URL}${path}" \
+    -H "Authorization: Bearer ${bearer}" -H 'Content-Type: application/json' -d "$body"
 }
 
 await_status() {
@@ -57,6 +65,37 @@ await_order_consumer_caught_up() {
 client_one="$(token client1)"
 client_two="$(token client2)"
 manager="$(token manager1)"
+
+configuration='{"c0000000-0000-0000-0000-000000000001":"d0000000-0000-0000-0000-000000000001","c0000000-0000-0000-0000-000000000002":"d0000000-0000-0000-0000-000000000004","c0000000-0000-0000-0000-000000000003":"d0000000-0000-0000-0000-000000000006","c0000000-0000-0000-0000-000000000004":"d0000000-0000-0000-0000-000000000008"}'
+custom_body="$(jq -nc --arg model "$MODEL_320" --argjson variants "$configuration" \
+  '{carModelId:$model,selectedVariants:$variants,totalPrice:0.01}')"
+custom_order="$(request POST '/api/orders/custom' "$client_one" "$custom_body")"
+jq -e '.totalPrice == 3500000' <<<"$custom_order" >/dev/null
+invalid_custom="$(jq -nc --arg model "$MODEL_320" \
+  '{carModelId:$model,selectedVariants:{},totalPrice:999999999}')"
+test "$(status_code POST '/api/orders/custom' "$client_one" "$invalid_custom")" = 400
+
+test_drive_start_epoch="$(jq -nr '((now / 3600 | floor) * 3600 + 172800)')"
+test_drive_start="$(jq -nr --argjson value "$test_drive_start_epoch" \
+  '$value | strftime("%Y-%m-%dT%H:%M:%S")')"
+test_drive_adjacent="$(jq -nr --argjson value "$((test_drive_start_epoch + 3600))" \
+  '$value | strftime("%Y-%m-%dT%H:%M:%S")')"
+test_drive_overlap="$(jq -nr --argjson value "$((test_drive_start_epoch + 1800))" \
+  '$value | strftime("%Y-%m-%dT%H:%M:%S")')"
+test_drive_unavailable="$(jq -nr --argjson value "$((test_drive_start_epoch + 86400))" \
+  '$value | strftime("%Y-%m-%dT%H:%M:%S")')"
+drive_body="$(jq -nc --arg car "$CAR_ONE" --arg time "$test_drive_start" \
+  '{carId:$car,scheduledAt:$time}')"
+request POST '/api/test-drives' "$client_one" "$drive_body" >/dev/null
+overlap_body="$(jq -nc --arg car "$CAR_ONE" --arg time "$test_drive_overlap" \
+  '{carId:$car,scheduledAt:$time}')"
+test "$(status_code POST '/api/test-drives' "$client_two" "$overlap_body")" = 409
+adjacent_body="$(jq -nc --arg car "$CAR_ONE" --arg time "$test_drive_adjacent" \
+  '{carId:$car,scheduledAt:$time}')"
+request POST '/api/test-drives' "$client_two" "$adjacent_body" >/dev/null
+unavailable_body="$(jq -nc --arg car "$CAR_TWO" --arg time "$test_drive_unavailable" \
+  '{carId:$car,scheduledAt:$time}')"
+test "$(status_code POST '/api/test-drives' "$client_one" "$unavailable_body")" = 409
 
 paid_order="$(request POST '/api/orders/stock' "$client_one" "{\"carId\":\"${CAR_ONE}\"}")"
 paid_id="$(jq -er '.id' <<<"$paid_order")"

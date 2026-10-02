@@ -9,3 +9,5 @@ databaseChangeLog:
       file: db/changelog/004-create-car-reservation-ledger.sql
   - include:
       file: db/changelog/005-reliable-messaging.sql
+  - include:
+      file: db/changelog/006-complete-m340i-configuration.sql

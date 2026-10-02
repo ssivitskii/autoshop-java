@@ -12,6 +12,7 @@ service CarGrpcService {
   rpc ReserveCar (ReserveCarRequest) returns (ReservationResponse);
   rpc ConfirmCar (ConfirmCarRequest) returns (ReservationResponse);
   rpc ReleaseCar (ReleaseCarRequest) returns (ReservationResponse);
+  rpc QuoteConfiguration (QuoteConfigurationRequest) returns (QuoteConfigurationResponse);
 }
 
 message GetAvailableCarsRequest {
@@ -43,6 +44,17 @@ message ConfirmCarRequest {
 message ReservationResponse {
   bool successful = 1;
   int64 expires_at_epoch_millis = 2;
+}
+
+message QuoteConfigurationRequest {
+  string car_model_id = 1;
+  map<string, string> selected_variants = 2;
+}
+
+message QuoteConfigurationResponse {
+  string car_model_id = 1;
+  map<string, string> selected_variants = 2;
+  string total_price = 3;
 }
 
 message CarDto {
