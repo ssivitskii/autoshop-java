@@ -1,71 +1,73 @@
 package dealership.order.core.application.service;
 
-import dealership.common.event.OrderSentForApprovalEvent;
+import dealership.order.core.application.port.out.StockCarReservationGateway;
 import dealership.order.core.application.port.out.StockOrderRepository;
 import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.domain.entity.order.StockOrder;
 import dealership.order.core.domain.entity.user.User;
-import dealership.order.core.domain.enums.StockOrderStatus;
 import dealership.order.core.domain.enums.UserRole;
 import dealership.order.core.domain.exception.DomainValidationException;
-import dealership.order.infrastructure.messaging.OrderEventProducer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Random;
-import java.util.UUID;
 
 @Service
 public class StockOrderService {
+    private static final Logger log = LoggerFactory.getLogger(StockOrderService.class);
+
     private final StockOrderRepository orderRepository;
     private final UserRepository userRepository;
-    private final OrderEventProducer eventProducer;
+    private final StockCarReservationGateway reservationGateway;
+    private final StockOrderTransactions transactions;
     private final Random random = new Random();
 
     public StockOrderService(StockOrderRepository orderRepository,
                              UserRepository userRepository,
-                             OrderEventProducer eventProducer) {
+                             StockCarReservationGateway reservationGateway,
+                             StockOrderTransactions transactions) {
         this.orderRepository = orderRepository;
         this.userRepository = userRepository;
-        this.eventProducer = eventProducer;
+        this.reservationGateway = reservationGateway;
+        this.transactions = transactions;
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public StockOrder createOrder(String clientId, String carId) {
         String managerId = assignRandomManager();
         StockOrder order = new StockOrder(null, clientId, managerId, carId);
-        return orderRepository.save(order);
+        try {
+            reservationGateway.reserve(carId, order.getId());
+        } catch (RuntimeException exception) {
+            releaseAfterFailure(order, exception);
+            throw exception;
+        }
+
+        try {
+            return transactions.saveNew(order);
+        } catch (RuntimeException exception) {
+            releaseAfterFailure(order, exception);
+            throw exception;
+        }
     }
 
     public StockOrder getOrderById(String orderId) {
         return orderRepository.findById(orderId);
     }
 
-    @Transactional
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public StockOrder cancelOrder(String orderId) {
-        StockOrder order = orderRepository.findById(orderId);
-        order.cancel();
-        return orderRepository.save(order);
+        StockOrder cancelled = transactions.cancel(orderId);
+        reservationGateway.release(cancelled.getCarId(), cancelled.getId());
+        return cancelled;
     }
 
-    @Transactional
     public StockOrder advanceOrder(String orderId) {
-        StockOrder order = orderRepository.findById(orderId);
-        StockOrderStatus statusBefore = order.getStatus();
-        order.advanceStatus();
-        StockOrder saved = orderRepository.save(order);
-
-        if (statusBefore == StockOrderStatus.AWAITING_PAYMENT && saved.getStatus() == StockOrderStatus.PAID) {
-            OrderSentForApprovalEvent event = new OrderSentForApprovalEvent();
-            event.setOrderId(saved.getId());
-            event.setOrderType("STOCK");
-            event.setTraceId(UUID.randomUUID().toString());
-            event.setCarId(saved.getCarId());
-            eventProducer.publishOrderPaid(event);
-        }
-
-        return saved;
+        return transactions.advance(orderId);
     }
 
     public List<StockOrder> getClientOrders(String clientId) {
@@ -82,5 +84,15 @@ public class StockOrderService {
             throw new DomainValidationException("Нет доступных менеджеров");
         }
         return managers.get(random.nextInt(managers.size())).getId();
+    }
+
+    private void releaseAfterFailure(StockOrder order, RuntimeException originalFailure) {
+        try {
+            reservationGateway.release(order.getCarId(), order.getId());
+        } catch (RuntimeException cleanupFailure) {
+            originalFailure.addSuppressed(cleanupFailure);
+            log.warn("Failed to release car {} for order {} during compensation",
+                    order.getCarId(), order.getId(), cleanupFailure);
+        }
     }
 }

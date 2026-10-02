@@ -2,6 +2,9 @@ package dealership.order;
 
 import dealership.common.grpc.*;
 import dealership.order.infrastructure.grpc.CarGrpcClient;
+import dealership.order.core.domain.exception.CarReservationConflictException;
+import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.StorageUnavailableException;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import org.junit.jupiter.api.DisplayName;
@@ -12,6 +15,8 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -93,5 +98,49 @@ class CarGrpcClientTest {
         StatusRuntimeException ex = assertThrows(StatusRuntimeException.class,
                 () -> carGrpcClient.getAvailableCars());
         assertEquals(Status.Code.DEADLINE_EXCEEDED, ex.getStatus().getCode());
+    }
+
+    @Test
+    @DisplayName("reserve использует deadline и подтверждает резерв")
+    void shouldReserveWithDeadline() {
+        String carId = UUID.randomUUID().toString();
+        String orderId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.reserveCar(any())).thenReturn(
+                ReservationResponse.newBuilder().setSuccessful(true).build());
+
+        carGrpcClient.reserve(carId, orderId);
+
+        verify(carStub).withDeadlineAfter(5, TimeUnit.SECONDS);
+        verify(carStub).reserveCar(argThat(request ->
+                request.getCarId().equals(carId) && request.getOrderId().equals(orderId)));
+    }
+
+    @Test
+    @DisplayName("reserve переводит конфликт склада в доменный 409")
+    void shouldTranslateReservationConflict() {
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.reserveCar(any())).thenThrow(Status.ALREADY_EXISTS.asRuntimeException());
+
+        assertThrows(CarReservationConflictException.class,
+                () -> carGrpcClient.reserve(UUID.randomUUID().toString(), UUID.randomUUID().toString()));
+    }
+
+    @Test
+    @DisplayName("reserve переводит timeout в недоступность склада")
+    void shouldTranslateReservationTimeout() {
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.reserveCar(any())).thenThrow(Status.DEADLINE_EXCEEDED.asRuntimeException());
+
+        assertThrows(StorageUnavailableException.class,
+                () -> carGrpcClient.reserve(UUID.randomUUID().toString(), UUID.randomUUID().toString()));
+    }
+
+    @Test
+    @DisplayName("reserve отклоняет невалидный UUID до вызова сети")
+    void shouldRejectInvalidReservationUuid() {
+        assertThrows(DomainValidationException.class,
+                () -> carGrpcClient.reserve("not-a-uuid", UUID.randomUUID().toString()));
+        verify(carStub, never()).reserveCar(any());
     }
 }

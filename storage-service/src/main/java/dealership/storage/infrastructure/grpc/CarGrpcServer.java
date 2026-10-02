@@ -5,14 +5,20 @@ import dealership.common.grpc.CarGrpcServiceGrpc;
 import dealership.common.grpc.GetAvailableCarsRequest;
 import dealership.common.grpc.GetAvailableCarsResponse;
 import dealership.common.grpc.GetCarByIdRequest;
+import dealership.common.grpc.ReleaseCarRequest;
+import dealership.common.grpc.ReservationResponse;
+import dealership.common.grpc.ReserveCarRequest;
+import dealership.storage.core.application.service.CarReservationService;
 import dealership.storage.core.application.service.CarSearchService;
 import dealership.storage.core.domain.entity.car.Car;
+import dealership.storage.core.domain.exception.CarReservationConflictException;
 import dealership.storage.core.domain.exception.EntityNotFoundException;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import net.devh.boot.grpc.server.service.GrpcService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataIntegrityViolationException;
 
 import java.util.List;
 
@@ -22,9 +28,54 @@ public class CarGrpcServer extends CarGrpcServiceGrpc.CarGrpcServiceImplBase {
     private static final Logger log = LoggerFactory.getLogger(CarGrpcServer.class);
 
     private final CarSearchService carSearchService;
+    private final CarReservationService carReservationService;
 
-    public CarGrpcServer(CarSearchService carSearchService) {
+    public CarGrpcServer(CarSearchService carSearchService,
+                         CarReservationService carReservationService) {
         this.carSearchService = carSearchService;
+        this.carReservationService = carReservationService;
+    }
+
+    @Override
+    public void reserveCar(ReserveCarRequest request,
+                           StreamObserver<ReservationResponse> responseObserver) {
+        try {
+            carReservationService.reserve(request.getCarId(), request.getOrderId());
+            responseObserver.onNext(ReservationResponse.newBuilder().setSuccessful(true).build());
+            responseObserver.onCompleted();
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
+        } catch (EntityNotFoundException e) {
+            responseObserver.onError(Status.NOT_FOUND.withDescription(e.getMessage()).asRuntimeException());
+        } catch (CarReservationConflictException e) {
+            responseObserver.onError(Status.ALREADY_EXISTS.withDescription(e.getMessage()).asRuntimeException());
+        } catch (DataIntegrityViolationException e) {
+            responseObserver.onError(Status.ALREADY_EXISTS
+                    .withDescription("Order already owns another car reservation")
+                    .asRuntimeException());
+        } catch (Exception e) {
+            log.error("gRPC: Failed to reserve car id={} for order id={}",
+                    request.getCarId(), request.getOrderId(), e);
+            responseObserver.onError(Status.INTERNAL.withDescription("Failed to reserve car").asRuntimeException());
+        }
+    }
+
+    @Override
+    public void releaseCar(ReleaseCarRequest request,
+                           StreamObserver<ReservationResponse> responseObserver) {
+        try {
+            carReservationService.release(request.getCarId(), request.getOrderId());
+            responseObserver.onNext(ReservationResponse.newBuilder().setSuccessful(true).build());
+            responseObserver.onCompleted();
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
+        } catch (EntityNotFoundException e) {
+            responseObserver.onError(Status.NOT_FOUND.withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            log.error("gRPC: Failed to release car id={} for order id={}",
+                    request.getCarId(), request.getOrderId(), e);
+            responseObserver.onError(Status.INTERNAL.withDescription("Failed to release car").asRuntimeException());
+        }
     }
 
     @Override

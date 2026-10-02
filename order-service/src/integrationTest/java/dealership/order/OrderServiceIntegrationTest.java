@@ -7,6 +7,8 @@ import dealership.order.core.domain.entity.order.StockOrder;
 import dealership.order.core.domain.entity.user.User;
 import dealership.order.core.domain.enums.StockOrderStatus;
 import dealership.order.core.domain.enums.UserRole;
+import dealership.order.core.domain.exception.StorageUnavailableException;
+import dealership.order.infrastructure.grpc.CarGrpcClient;
 import dealership.order.infrastructure.messaging.OutboxEvent;
 import dealership.order.infrastructure.messaging.OutboxRepository;
 import org.junit.jupiter.api.DisplayName;
@@ -16,11 +18,17 @@ import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMock
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -43,6 +51,11 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
 
     @Autowired
     private OutboxRepository outboxRepository;
+
+    // Boundary test: storage reservation behavior is covered against real PostgreSQL
+    // in storage-service; order integration tests isolate the remote gRPC dependency.
+    @MockBean
+    private CarGrpcClient reservationGateway;
 
     @Test
     @DisplayName("Liquibase миграции: таблицы созданы")
@@ -80,6 +93,33 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
         List<OutboxEvent> events = outboxRepository.findBySentFalseOrderByCreatedAtAsc();
         assertTrue(events.stream().anyMatch(e ->
                 e.getAggregateId().equals(order.getId()) && e.getEventType().equals("OrderSentForApproval")));
+    }
+
+    @Test
+    @DisplayName("Отмена фиксируется до release, а неудачный release можно повторить")
+    void shouldCommitCancellationBeforeReleaseAndRetryRelease() {
+        User manager = new User("mgr-cancel", "pass", "Manager Cancel", "cancel@test.com", "+7002", UserRole.MANAGER);
+        userRepository.save(manager);
+        StockOrder order = stockOrderService.createOrder("client-cancel", "car-cancel");
+        AtomicInteger releases = new AtomicInteger();
+        doAnswer(invocation -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            assertEquals(StockOrderStatus.CANCELLED,
+                    stockOrderRepository.findById(order.getId()).getStatus());
+            if (releases.getAndIncrement() == 0) {
+                throw new StorageUnavailableException("storage down", null);
+            }
+            return null;
+        }).when(reservationGateway).release(order.getCarId(), order.getId());
+
+        assertThrows(StorageUnavailableException.class,
+                () -> stockOrderService.cancelOrder(order.getId()));
+        assertEquals(StockOrderStatus.CANCELLED,
+                stockOrderRepository.findById(order.getId()).getStatus());
+
+        assertEquals(StockOrderStatus.CANCELLED,
+                stockOrderService.cancelOrder(order.getId()).getStatus());
+        verify(reservationGateway, times(2)).release(order.getCarId(), order.getId());
     }
 
     @Test

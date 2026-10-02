@@ -2,10 +2,12 @@ package dealership.order;
 
 import dealership.order.core.application.port.out.CustomOrderRepository;
 import dealership.order.core.application.port.out.StockOrderRepository;
+import dealership.order.core.application.port.out.StockCarReservationGateway;
 import dealership.order.core.application.port.out.TestDriveRequestRepository;
 import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.application.service.CustomOrderService;
 import dealership.order.core.application.service.StockOrderService;
+import dealership.order.core.application.service.StockOrderTransactions;
 import dealership.order.core.application.service.TestDriveService;
 import dealership.order.core.domain.entity.car.CarConfiguration;
 import dealership.order.core.domain.entity.order.CustomOrder;
@@ -24,6 +26,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
@@ -48,7 +51,9 @@ class ServiceTest {
         @Mock
         private UserRepository userRepository;
         @Mock
-        private OrderEventProducer eventProducer;
+        private StockCarReservationGateway reservationGateway;
+        @Mock
+        private StockOrderTransactions transactions;
         @InjectMocks
         private StockOrderService orderService;
 
@@ -63,13 +68,15 @@ class ServiceTest {
         @DisplayName("создание заказа: менеджер назначается")
         void shouldCreateOrder() {
             when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
-            when(orderRepository.save(any(StockOrder.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(transactions.saveNew(any(StockOrder.class))).thenAnswer(inv -> inv.getArgument(0));
 
             StockOrder order = orderService.createOrder("client-1", "car-1");
             assertNotNull(order.getId());
             assertEquals("client-1", order.getClientId());
             assertEquals(StockOrderStatus.CREATED, order.getStatus());
-            verify(orderRepository).save(any());
+            InOrder inOrder = inOrder(reservationGateway, transactions);
+            inOrder.verify(reservationGateway).reserve("car-1", order.getId());
+            inOrder.verify(transactions).saveNew(any());
         }
 
         @Test
@@ -83,37 +90,91 @@ class ServiceTest {
         @DisplayName("отмена заказа")
         void shouldCancelOrder() {
             StockOrder order = new StockOrder("cl", "m", "car");
-            when(orderRepository.findById(order.getId())).thenReturn(order);
-            when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            order.cancel();
+            when(transactions.cancel(order.getId())).thenReturn(order);
 
             StockOrder cancelled = orderService.cancelOrder(order.getId());
             assertEquals(StockOrderStatus.CANCELLED, cancelled.getStatus());
+            InOrder inOrder = inOrder(transactions, reservationGateway);
+            inOrder.verify(transactions).cancel(order.getId());
+            inOrder.verify(reservationGateway).release(order.getCarId(), order.getId());
         }
 
         @Test
-        @DisplayName("advance до PAID публикует событие в outbox")
-        void shouldPublishEventOnPaid() {
+        @DisplayName("advance делегируется локальной транзакции")
+        void shouldAdvanceInLocalTransaction() {
             StockOrder order = new StockOrder("cl", "m", "car");
             order.advanceStatus();
             order.advanceStatus();
+            order.advanceStatus();
 
-            when(orderRepository.findById(order.getId())).thenReturn(order);
-            when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(transactions.advance(order.getId())).thenReturn(order);
 
             StockOrder advanced = orderService.advanceOrder(order.getId());
             assertEquals(StockOrderStatus.PAID, advanced.getStatus());
-            verify(eventProducer).publishOrderPaid(any());
+            verify(transactions).advance(order.getId());
         }
 
         @Test
-        @DisplayName("advance НЕ до PAID НЕ публикует событие")
-        void shouldNotPublishEventBeforePaid() {
-            StockOrder order = new StockOrder("cl", "m", "car");
-            when(orderRepository.findById(order.getId())).thenReturn(order);
-            when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+        @DisplayName("ошибка локального сохранения компенсирует резерв")
+        void shouldReleaseReservationWhenSaveFails() {
+            when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
+            when(transactions.saveNew(any())).thenThrow(new RuntimeException("db down"));
 
-            orderService.advanceOrder(order.getId());
-            verify(eventProducer, never()).publishOrderPaid(any());
+            assertThrows(RuntimeException.class, () -> orderService.createOrder("cl", "car"));
+            var orderId = org.mockito.ArgumentCaptor.forClass(String.class);
+            verify(reservationGateway).reserve(eq("car"), orderId.capture());
+            verify(reservationGateway).release("car", orderId.getValue());
+        }
+
+        @Test
+        @DisplayName("конфликт резерва не создаёт локальный заказ")
+        void shouldNotSaveWhenReservationFails() {
+            when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
+            RuntimeException conflict = new RuntimeException("conflict");
+            doThrow(conflict).when(reservationGateway).reserve(eq("car"), anyString());
+
+            assertSame(conflict, assertThrows(RuntimeException.class,
+                    () -> orderService.createOrder("cl", "car")));
+            verify(transactions, never()).saveNew(any());
+        }
+
+        @Test
+        @DisplayName("ошибка компенсации не скрывает исходную ошибку")
+        void shouldPreserveOriginalFailureWhenCleanupFails() {
+            when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
+            RuntimeException original = new RuntimeException("reserve uncertain");
+            RuntimeException cleanup = new RuntimeException("cleanup failed");
+            doThrow(original).when(reservationGateway).reserve(eq("car"), anyString());
+            doThrow(cleanup).when(reservationGateway).release(eq("car"), anyString());
+
+            RuntimeException thrown = assertThrows(RuntimeException.class,
+                    () -> orderService.createOrder("cl", "car"));
+
+            assertSame(original, thrown);
+            assertArrayEquals(new Throwable[]{cleanup}, thrown.getSuppressed());
+        }
+
+        @Test
+        @DisplayName("ошибка фиксации отмены не освобождает автомобиль")
+        void shouldNotReleaseWhenCancelCommitFails() {
+            when(transactions.cancel("order")).thenThrow(new RuntimeException("commit failed"));
+
+            assertThrows(RuntimeException.class, () -> orderService.cancelOrder("order"));
+            verifyNoInteractions(reservationGateway);
+        }
+
+        @Test
+        @DisplayName("повтор отмены повторяет освобождение")
+        void shouldRetryReleaseForAlreadyCancelledOrder() {
+            StockOrder cancelled = new StockOrder("cl", "m", "car");
+            cancelled.cancel();
+            when(transactions.cancel(cancelled.getId())).thenReturn(cancelled);
+
+            orderService.cancelOrder(cancelled.getId());
+            orderService.cancelOrder(cancelled.getId());
+
+            verify(reservationGateway, times(2)).release(cancelled.getCarId(), cancelled.getId());
         }
 
         @Test
@@ -123,6 +184,61 @@ class ServiceTest {
             when(orderRepository.findAll()).thenReturn(List.of());
             assertTrue(orderService.getClientOrders("cl").isEmpty());
             assertTrue(orderService.getAllOrders().isEmpty());
+        }
+    }
+
+    @Nested
+    @DisplayName("StockOrderTransactions")
+    @ExtendWith(MockitoExtension.class)
+    class StockOrderTransactionTests {
+
+        @Mock
+        private StockOrderRepository orderRepository;
+        @Mock
+        private OrderEventProducer eventProducer;
+        @InjectMocks
+        private StockOrderTransactions transactions;
+
+        @Test
+        @DisplayName("advance блокирует строку и пишет outbox при переходе в PAID")
+        void shouldLockAndPublishWhenAdvancingToPaid() {
+            StockOrder order = new StockOrder("cl", "m", "car");
+            order.advanceStatus();
+            order.advanceStatus();
+            when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(orderRepository.save(order)).thenReturn(order);
+
+            StockOrder saved = transactions.advance(order.getId());
+
+            assertEquals(StockOrderStatus.PAID, saved.getStatus());
+            verify(orderRepository).findByIdForUpdate(order.getId());
+            verify(eventProducer).publishOrderPaid(any());
+        }
+
+        @Test
+        @DisplayName("advance до промежуточного статуса не пишет outbox")
+        void shouldNotPublishBeforePaid() {
+            StockOrder order = new StockOrder("cl", "m", "car");
+            when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(orderRepository.save(order)).thenReturn(order);
+
+            transactions.advance(order.getId());
+
+            verify(eventProducer, never()).publishOrderPaid(any());
+        }
+
+        @Test
+        @DisplayName("повторная отмена блокирует строку и не перезаписывает состояние")
+        void shouldLockButNotRewriteAlreadyCancelledOrder() {
+            StockOrder order = new StockOrder("cl", "m", "car");
+            order.cancel();
+            when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+
+            StockOrder result = transactions.cancel(order.getId());
+
+            assertSame(order, result);
+            verify(orderRepository).findByIdForUpdate(order.getId());
+            verify(orderRepository, never()).save(any());
         }
     }
 
