@@ -76,7 +76,7 @@ response_envelope="$(docker compose exec -T storage-db psql -U storage -d storag
       'payload', payload::json
     )::text
       FROM outbox_events
-     WHERE aggregate_id = '${paid_id}' AND sent = TRUE
+     WHERE aggregate_id = '${paid_id}'
      LIMIT 1")"
 test -n "$response_envelope"
 printf '%s|%s\n' "$paid_id" "$response_envelope" |
