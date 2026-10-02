@@ -225,7 +225,7 @@ class ReservationLifecycleE2ETest {
                         "--spring.security.oauth2.resourceserver.jwt.jwk-set-uri=" + keycloakBase() + "/realms/dealership/protocol/openid-connect/certs",
                         "--grpc.client.storage-service.address=static://127.0.0.1:" + grpcPort,
                         "--reservation.recovery.interval=PT0.2S",
-                        "--outbox.scheduler.rate=3600000"));
+                        "--outbox.publisher.interval=PT1H"));
     }
 
     private Process startJar(Path jar, Path log, List<String> args) throws IOException {

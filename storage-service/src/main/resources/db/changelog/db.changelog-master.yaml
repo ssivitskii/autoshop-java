@@ -7,3 +7,5 @@ databaseChangeLog:
       file: db/changelog/003-add-car-reservations.sql
   - include:
       file: db/changelog/004-create-car-reservation-ledger.sql
+  - include:
+      file: db/changelog/005-reliable-messaging.sql

@@ -4,6 +4,11 @@ import dealership.order.core.application.port.out.StockOrderRepository;
 import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.application.service.StockOrderService;
 import dealership.order.core.application.service.StockReservationRecoveryService;
+import dealership.order.core.application.service.CustomOrderService;
+import dealership.order.core.application.port.out.CustomOrderRepository;
+import dealership.order.core.domain.entity.car.CarConfiguration;
+import dealership.order.core.domain.entity.order.CustomOrder;
+import dealership.order.core.domain.enums.CustomOrderStatus;
 import dealership.order.core.domain.entity.order.StockOrder;
 import dealership.order.core.domain.entity.user.User;
 import dealership.order.core.domain.enums.StockOrderStatus;
@@ -14,6 +19,10 @@ import dealership.order.core.domain.exception.EntityNotFoundException;
 import dealership.order.infrastructure.grpc.CarGrpcClient;
 import dealership.order.infrastructure.messaging.OutboxEvent;
 import dealership.order.infrastructure.messaging.OutboxRepository;
+import dealership.order.infrastructure.messaging.OutboxClaimStore;
+import dealership.order.infrastructure.messaging.OrderResponseMessageTransactions;
+import dealership.common.event.OrderApprovedEvent;
+import dealership.common.event.PermanentMessageException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -30,6 +39,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.time.Instant;
+import java.time.Duration;
+import java.math.BigDecimal;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.doAnswer;
@@ -68,6 +80,18 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    @Autowired
+    private OutboxClaimStore outboxClaimStore;
+
+    @Autowired
+    private OrderResponseMessageTransactions responseTransactions;
+
+    @Autowired
+    private CustomOrderService customOrderService;
+
+    @Autowired
+    private CustomOrderRepository customOrderRepository;
+
     // Boundary test: storage reservation behavior is covered against real PostgreSQL
     // in storage-service; order integration tests isolate the remote gRPC dependency.
     @MockBean
@@ -85,6 +109,72 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     void shouldRunMigrations() {
         assertNotNull(stockOrderRepository);
         assertNotNull(outboxRepository);
+    }
+
+    @Test
+    @DisplayName("Outbox lease не позволяет устаревшему ACK завершить новый claim")
+    void shouldFenceStaleOutboxAcknowledgement() {
+        jdbcTemplate.update("UPDATE outbox_events SET next_attempt_at = clock_timestamp() + INTERVAL '1 hour' WHERE sent = FALSE");
+        OutboxEvent event = new OutboxEvent();
+        event.setAggregateType("STOCK");
+        event.setAggregateId(UUID.randomUUID().toString());
+        event.setEventType("OrderSentForApproval");
+        event.setPayload("{}");
+        event.setTraceId(UUID.randomUUID().toString());
+        outboxRepository.saveAndFlush(event);
+
+        var first = outboxClaimStore.claim(1, Duration.ofSeconds(30)).getFirst();
+        jdbcTemplate.update("UPDATE outbox_events SET claim_until = clock_timestamp() - INTERVAL '1 second' WHERE id = ?",
+                event.getId());
+        var second = outboxClaimStore.claim(1, Duration.ofSeconds(30)).getFirst();
+
+        assertNotEquals(first.claimToken(), second.claimToken());
+        assertFalse(outboxClaimStore.markSent(event.getId(), first.claimToken()));
+        assertTrue(outboxClaimStore.markSent(event.getId(), second.claimToken()));
+    }
+
+    @Test
+    @DisplayName("Inbox rollback позволяет повторить approval после исправления состояния")
+    void shouldRollbackInboxWithInvalidStockTransitionAndDeduplicateRetries() {
+        User manager = new User("mgr-inbox", "pass", "Manager Inbox", "inbox@test.com", "+7010", UserRole.MANAGER);
+        userRepository.save(manager);
+        StockOrder order = stockOrderService.createOrder("client-inbox", UUID.randomUUID().toString());
+        UUID eventId = UUID.randomUUID();
+        OrderApprovedEvent approved = new OrderApprovedEvent(
+                order.getId(), "STOCK", UUID.randomUUID().toString(), UUID.randomUUID().toString());
+
+        assertThrows(PermanentMessageException.class, () -> responseTransactions.processApproved(
+                eventId, "order.responses", 0, 1, approved));
+        assertEquals(0, inboxCount(eventId));
+
+        stockOrderService.advanceOrder(order.getId());
+        stockOrderService.advanceOrder(order.getId());
+        stockOrderService.advanceOrder(order.getId());
+        responseTransactions.processApproved(eventId, "order.responses", 0, 1, approved);
+        responseTransactions.processApproved(eventId, "order.responses", 0, 1, approved);
+        responseTransactions.processApproved(UUID.randomUUID(), "order.responses", 0, 2, approved);
+
+        assertEquals(StockOrderStatus.READY_FOR_PICKUP,
+                stockOrderRepository.findById(order.getId()).getStatus());
+    }
+
+    @Test
+    @DisplayName("Custom approval использует блокировку и повтор не продвигает заказ дважды")
+    void shouldApplyCustomApprovalExactlyOnceByState() {
+        CarConfiguration configuration = new CarConfiguration(UUID.randomUUID().toString());
+        CustomOrder order = customOrderService.createOrder(
+                "custom-client", UUID.randomUUID().toString(), configuration, new BigDecimal("1000000"));
+        customOrderService.advanceOrder(order.getId());
+        customOrderService.advanceOrder(order.getId());
+        customOrderService.advanceOrder(order.getId());
+        OrderApprovedEvent approved = new OrderApprovedEvent(
+                order.getId(), "CUSTOM", UUID.randomUUID().toString(), UUID.randomUUID().toString());
+
+        responseTransactions.processApproved(UUID.randomUUID(), "order.responses", 0, 3, approved);
+        responseTransactions.processApproved(UUID.randomUUID(), "order.responses", 0, 4, approved);
+
+        assertEquals(CustomOrderStatus.AWAITING_DELIVERY,
+                customOrderRepository.findById(order.getId()).getStatus());
     }
 
     @Test
@@ -271,5 +361,10 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
         return jdbcTemplate.queryForObject(
                 "SELECT state FROM stock_reservation_workflows WHERE order_id = ?",
                 String.class, java.util.UUID.fromString(orderId));
+    }
+
+    private int inboxCount(UUID eventId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM inbox_events WHERE event_id = ?", Integer.class, eventId);
     }
 }

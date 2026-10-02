@@ -12,11 +12,18 @@ import dealership.storage.core.domain.entity.car.Car;
 import dealership.storage.core.domain.enums.*;
 import dealership.storage.core.domain.exception.CarReservationConflictException;
 import dealership.storage.core.domain.exception.EntityNotFoundException;
+import dealership.storage.infrastructure.messaging.StorageOrderMessageTransactions;
+import org.apache.kafka.clients.consumer.Consumer;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.support.KafkaHeaders;
+import org.springframework.kafka.test.utils.KafkaTestUtils;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
@@ -29,6 +36,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.time.Duration;
+import java.util.Map;
+
+import static org.awaitility.Awaitility.await;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -61,6 +72,9 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
+
+    @Autowired
+    private StorageOrderMessageTransactions messageTransactions;
 
     @Test
     @DisplayName("Liquibase миграции: таблицы и seed data")
@@ -101,14 +115,100 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
         event.setOrderId(orderId);
         event.setOrderType("STOCK");
         event.setTraceId(traceId);
-        event.setCarId("car-123");
+        event.setCarId(UUID.randomUUID().toString());
 
         kafkaTemplate.send("order.events", orderId, objectMapper.writeValueAsString(event)).get();
 
-        Thread.sleep(5000);
+        await().atMost(Duration.ofSeconds(20)).until(
+                () -> assemblyOrderService.existsBySourceOrderId(orderId));
+    }
 
-        assertTrue(assemblyOrderService.existsBySourceOrderId(orderId),
-                "AssemblyOrder должен быть создан после получения Kafka события");
+    @Test
+    @DisplayName("Kafka: poison попадает в DLT, а следующее сообщение той же partition обрабатывается")
+    void shouldDeadLetterPoisonAndContinuePartition() throws Exception {
+        String poisonKey = UUID.randomUUID().toString();
+        String poison = "{not-json";
+        String orderId = UUID.randomUUID().toString();
+        OrderSentForApprovalEvent valid = new OrderSentForApprovalEvent();
+        valid.setOrderId(orderId);
+        valid.setOrderType("STOCK");
+        valid.setTraceId(UUID.randomUUID().toString());
+        valid.setCarId(UUID.randomUUID().toString());
+
+        Map<String, Object> consumerProperties = KafkaTestUtils.consumerProps(
+                kafka.getBootstrapServers(), "dlt-test-" + UUID.randomUUID(), "false");
+        try (Consumer<String, String> consumer = new DefaultKafkaConsumerFactory<>(
+                consumerProperties, new StringDeserializer(), new StringDeserializer()).createConsumer()) {
+            consumer.subscribe(List.of("order.events.DLT"));
+            kafkaTemplate.send("order.events", 0, poisonKey, poison).get(10, TimeUnit.SECONDS);
+            kafkaTemplate.send("order.events", 0, orderId, objectMapper.writeValueAsString(valid))
+                    .get(10, TimeUnit.SECONDS);
+
+            ConsumerRecord<String, String> deadLetter = KafkaTestUtils.getSingleRecord(
+                    consumer, "order.events.DLT", Duration.ofSeconds(20));
+            assertEquals(poisonKey, deadLetter.key());
+            assertEquals(poison, deadLetter.value());
+            assertNotNull(deadLetter.headers().lastHeader(KafkaHeaders.DLT_EXCEPTION_FQCN));
+            assertNotNull(deadLetter.headers().lastHeader(KafkaHeaders.DLT_ORIGINAL_OFFSET));
+            await().atMost(Duration.ofSeconds(20)).until(
+                    () -> assemblyOrderService.existsBySourceOrderId(orderId));
+        }
+    }
+
+    @Test
+    @DisplayName("Inbox и business key не дублируют сборку или response outbox")
+    void shouldDeduplicateInboxAndAssemblyBusinessKey() {
+        String orderId = UUID.randomUUID().toString();
+        OrderSentForApprovalEvent event = new OrderSentForApprovalEvent();
+        event.setOrderId(orderId);
+        event.setOrderType("STOCK");
+        event.setTraceId(UUID.randomUUID().toString());
+        event.setCarId(UUID.randomUUID().toString());
+        UUID firstEventId = UUID.randomUUID();
+        UUID secondEventId = UUID.randomUUID();
+
+        messageTransactions.process(firstEventId, "order.events", 0, 30, event);
+        messageTransactions.process(firstEventId, "order.events", 0, 30, event);
+        messageTransactions.process(secondEventId, "order.events", 0, 31, event);
+
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM assembly_orders WHERE source_order_id = ?", Integer.class, orderId));
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM outbox_events WHERE aggregate_id = ?", Integer.class, orderId));
+        assertEquals(2, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM inbox_events WHERE event_id IN (?, ?)",
+                Integer.class, firstEventId, secondEventId));
+    }
+
+    @Test
+    @DisplayName("Inbox, assembly и response outbox откатываются вместе")
+    void shouldRollbackWholeMessageTransactionAndAllowReplay() {
+        String orderId = UUID.randomUUID().toString();
+        UUID eventId = UUID.randomUUID();
+        OrderSentForApprovalEvent event = new OrderSentForApprovalEvent();
+        event.setOrderId(orderId);
+        event.setOrderType("STOCK");
+        event.setCarId(UUID.randomUUID().toString());
+        event.setTraceId("x".repeat(300));
+
+        assertThrows(RuntimeException.class,
+                () -> messageTransactions.process(eventId, "order.events", 0, 40, event));
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM inbox_events WHERE event_id = ?", Integer.class, eventId));
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM assembly_orders WHERE source_order_id = ?", Integer.class, orderId));
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM outbox_events WHERE aggregate_id = ?", Integer.class, orderId));
+
+        event.setTraceId(UUID.randomUUID().toString());
+        messageTransactions.process(eventId, "order.events", 0, 40, event);
+
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM inbox_events WHERE event_id = ?", Integer.class, eventId));
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM assembly_orders WHERE source_order_id = ?", Integer.class, orderId));
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "SELECT count(*) FROM outbox_events WHERE aggregate_id = ?", Integer.class, orderId));
     }
 
     @Test

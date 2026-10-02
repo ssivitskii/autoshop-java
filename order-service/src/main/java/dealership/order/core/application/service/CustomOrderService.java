@@ -48,14 +48,14 @@ public class CustomOrderService {
 
     @Transactional
     public CustomOrder cancelOrder(String orderId) {
-        CustomOrder order = orderRepository.findById(orderId);
+        CustomOrder order = orderRepository.findByIdForUpdate(orderId);
         order.cancel();
         return orderRepository.save(order);
     }
 
     @Transactional
     public CustomOrder advanceOrder(String orderId) {
-        CustomOrder order = orderRepository.findById(orderId);
+        CustomOrder order = orderRepository.findByIdForUpdate(orderId);
         CustomOrderStatus statusBefore = order.getStatus();
         order.advanceStatus(null);
         CustomOrder saved = orderRepository.save(order);
