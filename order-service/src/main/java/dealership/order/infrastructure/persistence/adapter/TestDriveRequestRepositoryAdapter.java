@@ -10,6 +10,7 @@ import dealership.order.infrastructure.persistence.repository.TestDriveRequestJp
 import org.springframework.stereotype.Repository;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.hibernate.exception.ConstraintViolationException;
+import org.postgresql.util.PSQLException;
 
 import java.sql.SQLException;
 
@@ -73,6 +74,12 @@ public class TestDriveRequestRepositoryAdapter implements TestDriveRequestReposi
             if (cause instanceof ConstraintViolationException constraintViolation
                     && "test_drive_no_overlapping_active".equals(
                     constraintViolation.getConstraintName())) {
+                namedConstraint = true;
+            }
+            if (cause instanceof PSQLException postgresException
+                    && postgresException.getServerErrorMessage() != null
+                    && "test_drive_no_overlapping_active".equals(
+                    postgresException.getServerErrorMessage().getConstraint())) {
                 namedConstraint = true;
             }
         }
