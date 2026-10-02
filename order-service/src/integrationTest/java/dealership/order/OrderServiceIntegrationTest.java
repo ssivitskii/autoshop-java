@@ -468,7 +468,8 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
                         .content("{"))
                 .andExpect(status().isBadRequest());
 
-        when(reservationGateway.get(anyString())).thenThrow(new EntityNotFoundException("missing"));
+        doThrow(new EntityNotFoundException("missing"))
+                .when(reservationGateway).get(anyString());
         mockMvc.perform(post("/api/test-drives")
                         .with(userJwt("http-client"))
                         .contentType("application/json")
