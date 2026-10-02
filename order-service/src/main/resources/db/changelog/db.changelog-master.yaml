@@ -3,3 +3,5 @@ databaseChangeLog:
       file: db/changelog/001-create-schema.sql
   - include:
       file: db/changelog/002-seed-data.sql
+  - include:
+      file: db/changelog/003-create-stock-reservation-workflows.sql

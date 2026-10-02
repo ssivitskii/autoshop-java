@@ -48,6 +48,12 @@ sourceSets {
         compileClasspath += sourceSets.main.output + configurations.testRuntimeClasspath
         runtimeClasspath += output + compileClasspath
     }
+    e2eTest {
+        java.srcDir file('src/e2eTest/java')
+        resources.srcDir file('src/e2eTest/resources')
+        compileClasspath += sourceSets.main.output + configurations.testRuntimeClasspath
+        runtimeClasspath += output + compileClasspath
+    }
 }
 
 configurations {
@@ -55,6 +61,10 @@ configurations {
     integrationTestRuntimeOnly.extendsFrom testRuntimeOnly
     integrationTestAnnotationProcessor.extendsFrom annotationProcessor
     integrationTestCompileOnly.extendsFrom compileOnly
+    e2eTestImplementation.extendsFrom testImplementation
+    e2eTestRuntimeOnly.extendsFrom testRuntimeOnly
+    e2eTestAnnotationProcessor.extendsFrom annotationProcessor
+    e2eTestCompileOnly.extendsFrom compileOnly
 }
 
 idea {
@@ -70,6 +80,20 @@ tasks.register('integrationTest', Test) {
     classpath = sourceSets.integrationTest.runtimeClasspath
     useJUnitPlatform()
     shouldRunAfter test
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
+}
+
+tasks.register('e2eTest', Test) {
+    description = 'Runs real two-service end-to-end tests (requires Docker)'
+    group = 'verification'
+    testClassesDirs = sourceSets.e2eTest.output.classesDirs
+    classpath = sourceSets.e2eTest.runtimeClasspath
+    useJUnitPlatform()
+    dependsOn ':order-service:bootJar', ':storage-service:bootJar'
+    shouldRunAfter integrationTest
+    systemProperty 'project.root.dir', rootProject.projectDir.absolutePath
     testLogging {
         events 'passed', 'skipped', 'failed'
     }

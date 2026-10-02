@@ -2,6 +2,7 @@ package dealership.order.infrastructure.grpc;
 
 import dealership.common.grpc.CarDto;
 import dealership.common.grpc.CarGrpcServiceGrpc;
+import dealership.common.grpc.ConfirmCarRequest;
 import dealership.common.grpc.GetAvailableCarsRequest;
 import dealership.common.grpc.GetAvailableCarsResponse;
 import dealership.common.grpc.GetCarByIdRequest;
@@ -20,6 +21,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
@@ -60,12 +62,33 @@ public class CarGrpcClient implements StockCarReservationGateway {
     }
 
     @Override
-    public void reserve(String carId, String orderId) {
+    public ReservationLease reserve(String carId, String orderId) {
         validateUuid(carId, "carId");
         validateUuid(orderId, "orderId");
         try {
             ReservationResponse response = carStub.withDeadlineAfter(RESERVATION_DEADLINE_SECONDS, TimeUnit.SECONDS)
                     .reserveCar(ReserveCarRequest.newBuilder()
+                            .setCarId(carId)
+                            .setOrderId(orderId)
+                            .build());
+            requireSuccessful(response);
+            if (response.getExpiresAtEpochMillis() <= 0) {
+                throw new StorageUnavailableException(
+                        "Сервис склада не вернул срок временного резерва", null);
+            }
+            return new ReservationLease(Instant.ofEpochMilli(response.getExpiresAtEpochMillis()));
+        } catch (StatusRuntimeException exception) {
+            throw translateReservationFailure(exception, carId);
+        }
+    }
+
+    @Override
+    public void confirm(String carId, String orderId) {
+        validateUuid(carId, "carId");
+        validateUuid(orderId, "orderId");
+        try {
+            ReservationResponse response = carStub.withDeadlineAfter(RESERVATION_DEADLINE_SECONDS, TimeUnit.SECONDS)
+                    .confirmCar(ConfirmCarRequest.newBuilder()
                             .setCarId(carId)
                             .setOrderId(orderId)
                             .build());

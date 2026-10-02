@@ -3,15 +3,19 @@ package dealership.order;
 import dealership.order.core.application.port.out.StockOrderRepository;
 import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.application.service.StockOrderService;
+import dealership.order.core.application.service.StockReservationRecoveryService;
 import dealership.order.core.domain.entity.order.StockOrder;
 import dealership.order.core.domain.entity.user.User;
 import dealership.order.core.domain.enums.StockOrderStatus;
 import dealership.order.core.domain.enums.UserRole;
 import dealership.order.core.domain.exception.StorageUnavailableException;
+import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.EntityNotFoundException;
 import dealership.order.infrastructure.grpc.CarGrpcClient;
 import dealership.order.infrastructure.messaging.OutboxEvent;
 import dealership.order.infrastructure.messaging.OutboxRepository;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -20,15 +24,21 @@ import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.jwt;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
@@ -52,10 +62,23 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     @Autowired
     private OutboxRepository outboxRepository;
 
+    @Autowired
+    private StockReservationRecoveryService recoveryService;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+
     // Boundary test: storage reservation behavior is covered against real PostgreSQL
     // in storage-service; order integration tests isolate the remote gRPC dependency.
     @MockBean
     private CarGrpcClient reservationGateway;
+
+    @BeforeEach
+    void stubStorageLease() {
+        when(reservationGateway.reserve(anyString(), anyString()))
+                .thenReturn(new dealership.order.core.application.port.out.StockCarReservationGateway.ReservationLease(
+                        Instant.now().plusSeconds(900)));
+    }
 
     @Test
     @DisplayName("Liquibase миграции: таблицы созданы")
@@ -123,6 +146,101 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
+    @DisplayName("CONFIRM_PENDING переживает transport failure и повтор не дублирует outbox")
+    void shouldReplayDurableConfirmationIntent() {
+        User manager = new User("mgr-confirm", "pass", "Manager Confirm", "confirm@test.com", "+7003", UserRole.MANAGER);
+        userRepository.save(manager);
+        StockOrder order = stockOrderService.createOrder("client-confirm", "car-confirm");
+        stockOrderService.advanceOrder(order.getId());
+        stockOrderService.advanceOrder(order.getId());
+        doThrow(new StorageUnavailableException("storage down", null))
+                .doNothing()
+                .when(reservationGateway).confirm(order.getCarId(), order.getId());
+
+        assertThrows(StorageUnavailableException.class,
+                () -> stockOrderService.advanceOrder(order.getId()));
+        assertEquals(StockOrderStatus.AWAITING_PAYMENT,
+                stockOrderRepository.findById(order.getId()).getStatus());
+        assertEquals("CONFIRM_PENDING", workflowState(order.getId()));
+        assertThrows(DomainValidationException.class,
+                () -> stockOrderService.cancelOrder(order.getId()));
+
+        recoveryService.processPending(order.getId());
+        recoveryService.processPending(order.getId());
+
+        assertEquals(StockOrderStatus.PAID,
+                stockOrderRepository.findById(order.getId()).getStatus());
+        assertEquals("CONFIRMED", workflowState(order.getId()));
+        long paidEvents = outboxRepository.findBySentFalseOrderByCreatedAtAsc().stream()
+                .filter(event -> event.getAggregateId().equals(order.getId()))
+                .filter(event -> event.getEventType().equals("OrderSentForApproval"))
+                .count();
+        assertEquals(1, paidEvents);
+    }
+
+    @Test
+    @DisplayName("RELEASE_PENDING после рестарта повторно освобождает отменённый заказ")
+    void shouldReplayDurableReleaseIntent() {
+        User manager = new User("mgr-release", "pass", "Manager Release", "release@test.com", "+7004", UserRole.MANAGER);
+        userRepository.save(manager);
+        StockOrder order = stockOrderService.createOrder("client-release", "car-release");
+        doThrow(new StorageUnavailableException("storage down", null))
+                .doNothing()
+                .when(reservationGateway).release(order.getCarId(), order.getId());
+
+        assertThrows(StorageUnavailableException.class,
+                () -> stockOrderService.cancelOrder(order.getId()));
+        assertEquals(StockOrderStatus.CANCELLED,
+                stockOrderRepository.findById(order.getId()).getStatus());
+        assertEquals("RELEASE_PENDING", workflowState(order.getId()));
+
+        recoveryService.processPending(order.getId());
+
+        assertEquals("RELEASED", workflowState(order.getId()));
+        verify(reservationGateway, times(2)).release(order.getCarId(), order.getId());
+    }
+
+    @Test
+    @DisplayName("LEGACY_UNVERIFIED без складского владельца отменяется вместо оплаты")
+    void shouldCancelUnverifiedLegacyOrderWhenStorageHasNoReservation() {
+        User manager = new User("mgr-legacy", "pass", "Manager Legacy", "legacy@test.com", "+7005", UserRole.MANAGER);
+        userRepository.save(manager);
+        StockOrder order = stockOrderService.createOrder("client-legacy", "car-legacy");
+        stockOrderService.advanceOrder(order.getId());
+        stockOrderService.advanceOrder(order.getId());
+        jdbcTemplate.update("UPDATE stock_reservation_workflows SET state = 'LEGACY_UNVERIFIED', storage_expires_at = NULL WHERE order_id = ?",
+                java.util.UUID.fromString(order.getId()));
+        doThrow(new EntityNotFoundException("missing"))
+                .when(reservationGateway).confirm(order.getCarId(), order.getId());
+
+        assertThrows(EntityNotFoundException.class,
+                () -> stockOrderService.advanceOrder(order.getId()));
+
+        assertEquals(StockOrderStatus.CANCELLED,
+                stockOrderRepository.findById(order.getId()).getStatus());
+        assertEquals("EXPIRED", workflowState(order.getId()));
+        assertTrue(outboxRepository.findBySentFalseOrderByCreatedAtAsc().stream()
+                .noneMatch(event -> event.getAggregateId().equals(order.getId())));
+    }
+
+    @Test
+    @DisplayName("Локально истёкший неоплаченный hold отменяется и освобождается")
+    void shouldCancelAndReleaseExpiredLocalHold() {
+        User manager = new User("mgr-expiry", "pass", "Manager Expiry", "expiry@test.com", "+7006", UserRole.MANAGER);
+        userRepository.save(manager);
+        StockOrder order = stockOrderService.createOrder("client-expiry", "car-expiry");
+        jdbcTemplate.update("UPDATE stock_reservation_workflows SET storage_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE order_id = ?",
+                java.util.UUID.fromString(order.getId()));
+
+        recoveryService.processExpiredHold(order.getId());
+
+        assertEquals(StockOrderStatus.CANCELLED,
+                stockOrderRepository.findById(order.getId()).getStatus());
+        assertEquals("RELEASED", workflowState(order.getId()));
+        verify(reservationGateway).release(order.getCarId(), order.getId());
+    }
+
+    @Test
     @DisplayName("REST: 401 без токена")
     void shouldReturn401WithoutToken() throws Exception {
         mockMvc.perform(get("/api/orders/stock"))
@@ -147,5 +265,11 @@ class OrderServiceIntegrationTest extends BaseIntegrationTest {
     void shouldAccessSwagger() throws Exception {
         mockMvc.perform(get("/v3/api-docs"))
                 .andExpect(status().isOk());
+    }
+
+    private String workflowState(String orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT state FROM stock_reservation_workflows WHERE order_id = ?",
+                String.class, java.util.UUID.fromString(orderId));
     }
 }

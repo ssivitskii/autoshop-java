@@ -58,3 +58,9 @@ grpc:
   server:
     address: 127.0.0.1
     port: 9090
+
+reservation:
+  hold-ttl: PT15M
+  recovery:
+    interval: PT10S
+    batch-size: 100

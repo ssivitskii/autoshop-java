@@ -17,6 +17,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.time.Instant;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -107,7 +108,10 @@ class CarGrpcClientTest {
         String orderId = UUID.randomUUID().toString();
         when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
         when(carStub.reserveCar(any())).thenReturn(
-                ReservationResponse.newBuilder().setSuccessful(true).build());
+                ReservationResponse.newBuilder()
+                        .setSuccessful(true)
+                        .setExpiresAtEpochMillis(Instant.now().plusSeconds(60).toEpochMilli())
+                        .build());
 
         carGrpcClient.reserve(carId, orderId);
 
@@ -142,5 +146,20 @@ class CarGrpcClientTest {
         assertThrows(DomainValidationException.class,
                 () -> carGrpcClient.reserve("not-a-uuid", UUID.randomUUID().toString()));
         verify(carStub, never()).reserveCar(any());
+    }
+
+    @Test
+    @DisplayName("confirm использует deadline и подтверждает ledger")
+    void shouldConfirmWithDeadline() {
+        String carId = UUID.randomUUID().toString();
+        String orderId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.confirmCar(any())).thenReturn(
+                ReservationResponse.newBuilder().setSuccessful(true).build());
+
+        carGrpcClient.confirm(carId, orderId);
+
+        verify(carStub).confirmCar(argThat(request ->
+                request.getCarId().equals(carId) && request.getOrderId().equals(orderId)));
     }
 }

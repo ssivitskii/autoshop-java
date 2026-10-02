@@ -85,4 +85,10 @@ public class CarRepositoryAdapter implements CarRepository {
             throw new EntityNotFoundException("Автомобиль с id '%s' не найден".formatted(carId));
         }
     }
+
+    @Override
+    @Transactional
+    public void releaseIfOwned(String carId, String orderId) {
+        jpaRepository.release(UUID.fromString(carId), UUID.fromString(orderId));
+    }
 }

@@ -6,6 +6,7 @@ import dealership.storage.core.application.port.out.AssemblyOrderRepository;
 import dealership.storage.core.application.port.out.CarRepository;
 import dealership.storage.core.application.service.AssemblyOrderService;
 import dealership.storage.core.application.service.CarReservationService;
+import dealership.storage.core.domain.enums.CarReservationState;
 import dealership.storage.core.domain.entity.assembly.AssemblyOrder;
 import dealership.storage.core.domain.entity.car.Car;
 import dealership.storage.core.domain.enums.*;
@@ -187,10 +188,11 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
         Car car = saveAvailableCar();
         String owner = UUID.randomUUID().toString();
 
-        carReservationService.reserve(car.getId(), owner);
-        carReservationService.reserve(car.getId(), owner);
+        CarReservationService.ReservationLease first = carReservationService.reserve(car.getId(), owner);
+        CarReservationService.ReservationLease retry = carReservationService.reserve(car.getId(), owner);
         carReservationService.release(car.getId(), UUID.randomUUID().toString());
 
+        assertEquals(first.expiresAt(), retry.expiresAt());
         assertEquals(owner, reservedBy(car.getId()));
         assertFalse(carRepository.findById(car.getId()).isAvailable());
     }
@@ -237,6 +239,70 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
+    @DisplayName("Резервирование: release до запоздалого reserve оставляет tombstone")
+    void shouldFenceDelayedReserveWithReleaseTombstone() {
+        Car car = saveAvailableCar();
+        String orderId = UUID.randomUUID().toString();
+
+        carReservationService.release(car.getId(), orderId);
+
+        assertThrows(CarReservationConflictException.class,
+                () -> carReservationService.reserve(car.getId(), orderId));
+        assertEquals("RELEASED", reservationState(orderId));
+        assertTrue(carRepository.findById(car.getId()).isAvailable());
+    }
+
+    @Test
+    @DisplayName("Резервирование: confirm и expiry сериализуются по ledger")
+    void shouldSerializeConfirmAndExpiry() throws Exception {
+        Car car = saveAvailableCar();
+        String orderId = UUID.randomUUID().toString();
+        carReservationService.reserve(car.getId(), orderId);
+        jdbcTemplate.update("UPDATE car_reservations SET hold_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE order_id = ?",
+                UUID.fromString(orderId));
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<CarReservationService.ConfirmationResult> confirmation = executor.submit(() -> {
+                ready.countDown();
+                start.await(10, TimeUnit.SECONDS);
+                return carReservationService.confirm(car.getId(), orderId);
+            });
+            Future<Boolean> expiration = executor.submit(() -> {
+                ready.countDown();
+                start.await(10, TimeUnit.SECONDS);
+                return carReservationService.expireIfDue(UUID.fromString(orderId));
+            });
+            boolean allReady = ready.await(10, TimeUnit.SECONDS);
+            start.countDown();
+            assertTrue(allReady);
+            assertNotEquals(CarReservationService.ConfirmationResult.CONFIRMED,
+                    confirmation.get(10, TimeUnit.SECONDS));
+            expiration.get(10, TimeUnit.SECONDS);
+        }
+
+        assertEquals(CarReservationState.EXPIRED.name(), reservationState(orderId));
+        assertTrue(carRepository.findById(car.getId()).isAvailable());
+    }
+
+    @Test
+    @DisplayName("Резервирование: подтверждённая бронь не истекает")
+    void shouldRetainConfirmedReservationPastOriginalDeadline() {
+        Car car = saveAvailableCar();
+        String orderId = UUID.randomUUID().toString();
+        carReservationService.reserve(car.getId(), orderId);
+        assertEquals(CarReservationService.ConfirmationResult.CONFIRMED,
+                carReservationService.confirm(car.getId(), orderId));
+        jdbcTemplate.update("UPDATE car_reservations SET hold_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE order_id = ?",
+                UUID.fromString(orderId));
+
+        assertFalse(carReservationService.expireIfDue(UUID.fromString(orderId)));
+        assertEquals(CarReservationState.CONFIRMED.name(), reservationState(orderId));
+        assertFalse(carRepository.findById(car.getId()).isAvailable());
+    }
+
+    @Test
     @WithMockUser(roles = "WAREHOUSE_ADMIN")
     @DisplayName("REST: WAREHOUSE_ADMIN может видеть запчасти")
     void shouldAllowWarehouseAdminParts() throws Exception {
@@ -278,5 +344,11 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
                 "SELECT reserved_by_order_id FROM cars WHERE id = ?",
                 UUID.class, UUID.fromString(carId));
         return owner == null ? null : owner.toString();
+    }
+
+    private String reservationState(String orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT state FROM car_reservations WHERE order_id = ?",
+                String.class, UUID.fromString(orderId));
     }
 }

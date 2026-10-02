@@ -32,6 +32,7 @@ public abstract class BaseIntegrationTest {
         registry.add("spring.datasource.username", postgres::getUsername);
         registry.add("spring.datasource.password", postgres::getPassword);
         registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+        registry.add("reservation.recovery.interval", () -> "PT1H");
         registry.add("spring.security.oauth2.resourceserver.jwt.issuer-uri",
                 () -> "http://localhost:18080/realms/test");
         registry.add("spring.security.oauth2.resourceserver.jwt.jwk-set-uri",
