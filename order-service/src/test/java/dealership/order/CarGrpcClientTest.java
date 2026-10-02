@@ -5,6 +5,8 @@ import dealership.order.infrastructure.grpc.CarGrpcClient;
 import dealership.order.core.domain.exception.CarReservationConflictException;
 import dealership.order.core.domain.exception.DomainValidationException;
 import dealership.order.core.domain.exception.StorageUnavailableException;
+import dealership.order.core.domain.exception.EntityNotFoundException;
+import dealership.order.core.domain.exception.IncompatibleComponentException;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import org.junit.jupiter.api.DisplayName;
@@ -18,6 +20,8 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.time.Instant;
+import java.math.BigDecimal;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -161,5 +165,128 @@ class CarGrpcClientTest {
 
         verify(carStub).confirmCar(argThat(request ->
                 request.getCarId().equals(carId) && request.getOrderId().equals(orderId)));
+    }
+
+    @Test
+    @DisplayName("quote нормализует UUID и проверяет server snapshot")
+    void shouldQuoteCanonicalConfiguration() {
+        String modelId = UUID.randomUUID().toString();
+        String categoryId = UUID.randomUUID().toString();
+        String variantId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.quoteConfiguration(any())).thenReturn(QuoteConfigurationResponse.newBuilder()
+                .setCarModelId(modelId)
+                .putSelectedVariants(categoryId, variantId)
+                .setTotalPrice("3500000.00")
+                .build());
+
+        var quote = carGrpcClient.quote(
+                modelId.toUpperCase(), Map.of(categoryId.toUpperCase(), variantId.toUpperCase()));
+
+        assertEquals(modelId, quote.carModelId());
+        assertEquals(Map.of(categoryId, variantId), quote.selectedVariants());
+        assertEquals(new BigDecimal("3500000.00"), quote.totalPrice());
+        verify(carStub).quoteConfiguration(argThat(request ->
+                request.getCarModelId().equals(modelId)
+                        && request.getSelectedVariantsMap().equals(Map.of(categoryId, variantId))));
+    }
+
+    @Test
+    @DisplayName("quote отклоняет несовпадающий server snapshot как 503")
+    void shouldRejectMismatchedQuoteResponse() {
+        String modelId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.quoteConfiguration(any())).thenReturn(QuoteConfigurationResponse.newBuilder()
+                .setCarModelId(UUID.randomUUID().toString())
+                .setTotalPrice("1.00")
+                .build());
+
+        assertThrows(StorageUnavailableException.class,
+                () -> carGrpcClient.quote(modelId, Map.of()));
+    }
+
+    @Test
+    @DisplayName("quote отклоняет не-DЕCIMAL(15,2) и неположительные цены как 503")
+    void shouldRejectMalformedQuotePrices() {
+        String modelId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.quoteConfiguration(any())).thenReturn(
+                quote(modelId, "0"),
+                quote(modelId, "-1.00"),
+                quote(modelId, "1.001"),
+                quote(modelId, "10000000000000.00"),
+                quote(modelId, "1e9"),
+                quote(modelId, ""));
+
+        for (int attempt = 0; attempt < 6; attempt++) {
+            assertThrows(StorageUnavailableException.class,
+                    () -> carGrpcClient.quote(modelId, Map.of()));
+        }
+    }
+
+    @Test
+    @DisplayName("quote переводит expected gRPC statuses")
+    void shouldTranslateQuoteStatuses() {
+        String modelId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.quoteConfiguration(any()))
+                .thenThrow(Status.INVALID_ARGUMENT.asRuntimeException())
+                .thenThrow(Status.NOT_FOUND.asRuntimeException())
+                .thenThrow(Status.FAILED_PRECONDITION.asRuntimeException())
+                .thenThrow(Status.UNAVAILABLE.asRuntimeException())
+                .thenThrow(Status.DEADLINE_EXCEEDED.asRuntimeException());
+
+        assertThrows(DomainValidationException.class,
+                () -> carGrpcClient.quote(modelId, Map.of()));
+        assertThrows(EntityNotFoundException.class,
+                () -> carGrpcClient.quote(modelId, Map.of()));
+        assertThrows(IncompatibleComponentException.class,
+                () -> carGrpcClient.quote(modelId, Map.of()));
+        assertThrows(StorageUnavailableException.class,
+                () -> carGrpcClient.quote(modelId, Map.of()));
+        assertThrows(StorageUnavailableException.class,
+                () -> carGrpcClient.quote(modelId, Map.of()));
+    }
+
+    @Test
+    @DisplayName("test-drive lookup проверяет availability и echoed id")
+    void shouldValidateTestDriveCar() {
+        String carId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.getCarById(any())).thenReturn(CarDto.newBuilder()
+                .setId(carId).setAvailable(true).setAvailableForTestDrive(true).build());
+
+        var car = carGrpcClient.get(carId.toUpperCase());
+
+        assertEquals(carId, car.id());
+        verify(carStub).getCarById(argThat(request -> request.getId().equals(carId)));
+    }
+
+    @Test
+    @DisplayName("test-drive lookup возвращает фактические availability flags")
+    void shouldReturnUnavailableTestDriveFlags() {
+        String carId = UUID.randomUUID().toString();
+        when(carStub.withDeadlineAfter(5, TimeUnit.SECONDS)).thenReturn(carStub);
+        when(carStub.getCarById(any())).thenReturn(CarDto.newBuilder()
+                .setId(carId).setAvailable(false).setAvailableForTestDrive(true).build());
+
+        var car = carGrpcClient.get(carId);
+
+        assertFalse(car.available());
+        assertTrue(car.availableForTestDrive());
+    }
+
+    @Test
+    @DisplayName("test-drive malformed UUID не вызывает сеть")
+    void shouldRejectMalformedTestDriveUuidBeforeNetwork() {
+        assertThrows(DomainValidationException.class, () -> carGrpcClient.get("not-a-uuid"));
+        verify(carStub, never()).getCarById(any());
+    }
+
+    private QuoteConfigurationResponse quote(String modelId, String totalPrice) {
+        return QuoteConfigurationResponse.newBuilder()
+                .setCarModelId(modelId)
+                .setTotalPrice(totalPrice)
+                .build();
     }
 }

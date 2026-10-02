@@ -1,9 +1,11 @@
 package dealership.order;
 
 import dealership.order.core.application.port.out.CustomOrderRepository;
+import dealership.order.core.application.port.out.CustomConfigurationGateway;
 import dealership.order.core.application.port.out.StockOrderRepository;
 import dealership.order.core.application.port.out.StockCarReservationGateway;
 import dealership.order.core.application.port.out.TestDriveRequestRepository;
+import dealership.order.core.application.port.out.TestDriveCarGateway;
 import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.application.service.CustomOrderService;
 import dealership.order.core.application.service.StockOrderService;
@@ -38,9 +40,13 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.Instant;
+import java.time.Clock;
+import java.time.ZoneId;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -301,6 +307,8 @@ class ServiceTest {
         private UserRepository userRepository;
         @Mock
         private OrderEventProducer eventProducer;
+        @Mock
+        private CustomConfigurationGateway configurationGateway;
         @InjectMocks
         private CustomOrderService customOrderService;
 
@@ -314,14 +322,35 @@ class ServiceTest {
         @Test
         @DisplayName("создание кастомного заказа")
         void shouldCreateCustomOrder() {
-            CarConfiguration config = new CarConfiguration("model-1");
-            config.selectVariant("cat-1", "var-1");
+            String modelId = UUID.randomUUID().toString();
+            Map<String, String> selection = Map.of(
+                    UUID.randomUUID().toString(), UUID.randomUUID().toString());
             when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
             when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(configurationGateway.quote(modelId, selection)).thenReturn(
+                    new CustomConfigurationGateway.ConfigurationQuote(
+                            modelId, selection, new BigDecimal("3500000.00")));
 
-            CustomOrder order = customOrderService.createOrder("cl", "model-1", config, new BigDecimal("3500000"));
+            CustomOrder order = customOrderService.createOrder("cl", modelId, selection);
             assertNotNull(order.getId());
             assertEquals(CustomOrderStatus.CREATED, order.getStatus());
+            assertEquals("cl", order.getClientId());
+            assertEquals(testManager.getId(), order.getManagerId());
+            assertEquals(new BigDecimal("3500000.00"), order.getTotalPrice());
+        }
+
+        @Test
+        @DisplayName("ошибка quote не создаёт заказ")
+        void shouldNotCreateOrderWhenQuoteFails() {
+            String modelId = UUID.randomUUID().toString();
+            when(configurationGateway.quote(eq(modelId), any()))
+                    .thenThrow(new StorageUnavailableException("down", null));
+
+            assertThrows(StorageUnavailableException.class,
+                    () -> customOrderService.createOrder("cl", modelId, Map.of()));
+
+            verifyNoInteractions(orderRepository);
+            verify(userRepository, never()).findByRole(any());
         }
 
         @Test
@@ -351,16 +380,69 @@ class ServiceTest {
         private TestDriveRequestRepository requestRepository;
         @Mock
         private UserRepository userRepository;
-        @InjectMocks
+        @Mock
+        private TestDriveCarGateway carGateway;
         private TestDriveService testDriveService;
+        private MutableClock clock;
+
+        @BeforeEach
+        void setUp() {
+            clock = new MutableClock(Instant.parse("2026-10-02T09:00:00Z"),
+                    ZoneId.of("Europe/Moscow"));
+            testDriveService = new TestDriveService(requestRepository, userRepository, carGateway, clock);
+        }
 
         @Test
         @DisplayName("создание заявки на тест-драйв")
         void shouldCreateRequest() {
+            String carId = UUID.randomUUID().toString();
+            LocalDateTime scheduledAt = LocalDateTime.now(clock).plusHours(1);
             when(requestRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
-            TestDriveRequest req = testDriveService.createRequest("cl", "car", LocalDateTime.now().plusDays(1));
+            when(carGateway.get(carId)).thenReturn(new TestDriveCarGateway.TestDriveCar(carId, true, true));
+            TestDriveRequest req = testDriveService.createRequest("cl", carId, scheduledAt);
             assertNotNull(req.getId());
             assertEquals(TestDriveStatus.PENDING, req.getStatus());
+        }
+
+        @Test
+        @DisplayName("прошедшее и текущее время отклоняются без RPC")
+        void shouldRejectPastAndCurrentTimeBeforeRpc() {
+            assertThrows(DomainValidationException.class, () -> testDriveService.createRequest(
+                    "cl", UUID.randomUUID().toString(), LocalDateTime.now(clock).minusSeconds(1)));
+            assertThrows(DomainValidationException.class, () -> testDriveService.createRequest(
+                    "cl", UUID.randomUUID().toString(), LocalDateTime.now(clock)));
+            verifyNoInteractions(carGateway, requestRepository);
+        }
+
+        @Test
+        @DisplayName("время повторно проверяется после RPC")
+        void shouldRecheckTimeAfterRpc() {
+            String carId = UUID.randomUUID().toString();
+            LocalDateTime scheduledAt = LocalDateTime.now(clock).plusMinutes(1);
+            when(carGateway.get(carId)).thenAnswer(invocation -> {
+                clock.advance(java.time.Duration.ofMinutes(2));
+                return new TestDriveCarGateway.TestDriveCar(carId, true, true);
+            });
+
+            assertThrows(DomainValidationException.class,
+                    () -> testDriveService.createRequest("cl", carId, scheduledAt));
+            verify(requestRepository, never()).save(any());
+        }
+
+        @Test
+        @DisplayName("недоступный или неразрешённый для тест-драйва автомобиль даёт конфликт")
+        void shouldRejectUnavailableCar() {
+            String carId = UUID.randomUUID().toString();
+            LocalDateTime scheduledAt = LocalDateTime.now(clock).plusHours(1);
+            when(carGateway.get(carId)).thenReturn(
+                    new TestDriveCarGateway.TestDriveCar(carId, true, false),
+                    new TestDriveCarGateway.TestDriveCar(carId, false, true));
+
+            assertThrows(dealership.order.core.domain.exception.TestDriveConflictException.class,
+                    () -> testDriveService.createRequest("cl", carId, scheduledAt));
+            assertThrows(dealership.order.core.domain.exception.TestDriveConflictException.class,
+                    () -> testDriveService.createRequest("cl", carId, scheduledAt));
+            verify(requestRepository, never()).save(any());
         }
 
         @Test
@@ -375,6 +457,35 @@ class ServiceTest {
         void shouldGetByCarId() {
             when(requestRepository.findByCarId("car1")).thenReturn(List.of());
             assertTrue(testDriveService.getRequestsByCarId("car1").isEmpty());
+        }
+
+        private static final class MutableClock extends Clock {
+            private final AtomicReference<Instant> instant;
+            private final ZoneId zone;
+
+            private MutableClock(Instant instant, ZoneId zone) {
+                this.instant = new AtomicReference<>(instant);
+                this.zone = zone;
+            }
+
+            void advance(java.time.Duration duration) {
+                instant.updateAndGet(value -> value.plus(duration));
+            }
+
+            @Override
+            public ZoneId getZone() {
+                return zone;
+            }
+
+            @Override
+            public Clock withZone(ZoneId zone) {
+                return new MutableClock(instant.get(), zone);
+            }
+
+            @Override
+            public Instant instant() {
+                return instant.get();
+            }
         }
     }
 }

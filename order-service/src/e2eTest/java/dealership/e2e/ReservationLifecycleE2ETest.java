@@ -28,6 +28,8 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -101,6 +103,8 @@ class ReservationLifecycleE2ETest {
         String clientTwo = token("client2");
         String manager = token("manager1");
 
+        verifyRealQuoteAndTestDrive(clientOne);
+
         JsonNode first = createOrder(clientOne, CAR_ONE, 201);
         createOrder(clientTwo, CAR_ONE, 409);
         request("POST", "/api/orders/stock/" + first.get("id").asText() + "/cancel",
@@ -159,6 +163,34 @@ class ReservationLifecycleE2ETest {
                 "SELECT state FROM stock_reservation_workflows WHERE order_id = ?::uuid", paidId));
         assertEquals("PAID", orderValue("SELECT status FROM stock_orders WHERE id = ?::uuid", paidId));
         assertEquals("false", storageValue("SELECT available::text FROM cars WHERE id = ?::uuid", CAR_ONE));
+    }
+
+    private void verifyRealQuoteAndTestDrive(String token) throws Exception {
+        String modelId = "b0000000-0000-0000-0000-000000000001";
+        Map<String, String> variants = Map.of(
+                "c0000000-0000-0000-0000-000000000001", "d0000000-0000-0000-0000-000000000001",
+                "c0000000-0000-0000-0000-000000000002", "d0000000-0000-0000-0000-000000000004",
+                "c0000000-0000-0000-0000-000000000003", "d0000000-0000-0000-0000-000000000006",
+                "c0000000-0000-0000-0000-000000000004", "d0000000-0000-0000-0000-000000000008");
+        String customBody = json.writeValueAsString(Map.of(
+                "carModelId", modelId,
+                "selectedVariants", variants,
+                "totalPrice", "0.01"));
+        JsonNode customOrder = json.readTree(request(
+                "POST", "/api/orders/custom", token, customBody, 201).body());
+        assertEquals("3500000.00", customOrder.get("totalPrice").decimalValue().setScale(2).toPlainString());
+        request("POST", "/api/orders/custom", token, json.writeValueAsString(Map.of(
+                "carModelId", modelId, "selectedVariants", Map.of(), "totalPrice", "999999999")), 400);
+
+        LocalDateTime start = LocalDateTime.now().plusDays(2).truncatedTo(ChronoUnit.SECONDS);
+        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
+                "carId", CAR_ONE, "scheduledAt", start.toString())), 201);
+        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
+                "carId", CAR_ONE, "scheduledAt", start.plusMinutes(30).toString())), 409);
+        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
+                "carId", CAR_ONE, "scheduledAt", start.plusHours(1).toString())), 201);
+        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
+                "carId", CAR_TWO, "scheduledAt", start.plusDays(1).toString())), 409);
     }
 
     private JsonNode createOrder(String token, String carId, int status) throws Exception {

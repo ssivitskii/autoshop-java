@@ -35,7 +35,7 @@ public class CustomOrder {
             String carModelId,
             CarConfiguration configuration,
             BigDecimal totalPrice) {
-        this(null, clientId, managerId, carModelId, configuration, totalPrice);
+        this(null, managerId, clientId, carModelId, configuration, totalPrice);
     }
 
     public CustomOrder(String id, String managerId, String clientId, String carModelId, CarConfiguration configuration, BigDecimal totalPrice) {
@@ -50,6 +50,9 @@ public class CustomOrder {
         }
         if (configuration == null) {
             throw new DomainValidationException("Конфигурация не может быть null");
+        }
+        if (!carModelId.equals(configuration.getCarModelId())) {
+            throw new DomainValidationException("Модель конфигурации не совпадает с моделью заказа");
         }
         if (totalPrice == null || totalPrice.compareTo(BigDecimal.ZERO) < 0) {
             throw new DomainValidationException("Цена должна быть положительной");

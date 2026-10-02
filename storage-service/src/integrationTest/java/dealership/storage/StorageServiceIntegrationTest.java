@@ -6,6 +6,9 @@ import dealership.storage.core.application.port.out.AssemblyOrderRepository;
 import dealership.storage.core.application.port.out.CarRepository;
 import dealership.storage.core.application.service.AssemblyOrderService;
 import dealership.storage.core.application.service.CarReservationService;
+import dealership.storage.core.application.service.CarConfigurationService;
+import dealership.storage.core.application.dto.CarConfigurationRequestDto;
+import dealership.storage.core.domain.exception.DomainValidationException;
 import dealership.storage.core.domain.enums.CarReservationState;
 import dealership.storage.core.domain.entity.assembly.AssemblyOrder;
 import dealership.storage.core.domain.entity.car.Car;
@@ -71,6 +74,9 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
     private CarReservationService carReservationService;
 
     @Autowired
+    private CarConfigurationService carConfigurationService;
+
+    @Autowired
     private JdbcTemplate jdbcTemplate;
 
     @Autowired
@@ -80,6 +86,35 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
     @DisplayName("Liquibase миграции: таблицы и seed data")
     void shouldRunMigrations() {
         assertFalse(carRepository.findAvailable().isEmpty());
+    }
+
+    @Test
+    @DisplayName("Seed: все три модели имеют полную валидную конфигурацию")
+    void shouldQuoteAllSeedModelsIncludingM340i() {
+        Map<String, String> categories320 = Map.of(
+                "c0000000-0000-0000-0000-000000000001", "d0000000-0000-0000-0000-000000000001",
+                "c0000000-0000-0000-0000-000000000002", "d0000000-0000-0000-0000-000000000004",
+                "c0000000-0000-0000-0000-000000000003", "d0000000-0000-0000-0000-000000000006",
+                "c0000000-0000-0000-0000-000000000004", "d0000000-0000-0000-0000-000000000008");
+        Map<String, String> categories330 = Map.of(
+                "c0000000-0000-0000-0000-000000000001", "d0000000-0000-0000-0000-000000000002",
+                "c0000000-0000-0000-0000-000000000002", "d0000000-0000-0000-0000-000000000004",
+                "c0000000-0000-0000-0000-000000000003", "d0000000-0000-0000-0000-000000000007",
+                "c0000000-0000-0000-0000-000000000004", "d0000000-0000-0000-0000-000000000009");
+        Map<String, String> categoriesM340 = Map.of(
+                "c0000000-0000-0000-0000-000000000001", "d0000000-0000-0000-0000-000000000002",
+                "c0000000-0000-0000-0000-000000000002", "d0000000-0000-0000-0000-000000000004",
+                "c0000000-0000-0000-0000-000000000003", "d0000000-0000-0000-0000-000000000007",
+                "c0000000-0000-0000-0000-000000000004", "d0000000-0000-0000-0000-000000000010");
+
+        assertTrue(quote("b0000000-0000-0000-0000-000000000001", categories320)
+                .getTotalPrice().signum() > 0);
+        assertTrue(quote("b0000000-0000-0000-0000-000000000002", categories330)
+                .getTotalPrice().signum() > 0);
+        assertTrue(quote("b0000000-0000-0000-0000-000000000003", categoriesM340)
+                .getTotalPrice().signum() > 0);
+        assertThrows(DomainValidationException.class,
+                () -> quote("b0000000-0000-0000-0000-000000000003", Map.of()));
     }
 
     @Test
@@ -437,6 +472,13 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
                 "Test", "Reservation", BodyType.SEDAN, FuelType.PETROL,
                 150, 2.0, TransmissionType.AUTOMATIC, DriveType.FRONT,
                 Color.BLACK, new BigDecimal("1000000")));
+    }
+
+    private dealership.storage.core.application.dto.ConfigurationResultDto quote(
+            String modelId, Map<String, String> selection) {
+        CarConfigurationRequestDto request = new CarConfigurationRequestDto(modelId);
+        request.setSelectedVariants(selection);
+        return carConfigurationService.configure(request);
     }
 
     private String reservedBy(String carId) {

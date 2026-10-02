@@ -1,7 +1,6 @@
 package dealership.order.infrastructure.web.controller;
 
 import dealership.order.core.application.service.CustomOrderService;
-import dealership.order.core.domain.entity.car.CarConfiguration;
 import dealership.order.core.domain.entity.order.CustomOrder;
 import dealership.order.infrastructure.web.dto.request.CreateCustomOrderRequest;
 import dealership.order.infrastructure.web.dto.response.CustomOrderResponse;
@@ -15,7 +14,6 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
-import java.math.BigDecimal;
 import java.util.List;
 
 @RestController
@@ -38,13 +36,8 @@ public class CustomOrderController {
     public ResponseEntity<CustomOrderResponse> create(@RequestBody CreateCustomOrderRequest request,
                                                       @AuthenticationPrincipal Jwt jwt) {
         String userId = jwt.getSubject();
-        CarConfiguration config = new CarConfiguration(request.getCarModelId());
-        if (request.getSelectedVariants() != null) {
-            request.getSelectedVariants().forEach(config::selectVariant);
-        }
         CustomOrder order = customOrderService.createOrder(userId,
-                request.getCarModelId(), config,
-                request.getTotalPrice() != null ? request.getTotalPrice() : BigDecimal.ZERO);
+                request.getCarModelId(), request.getSelectedVariants());
         return ResponseEntity.status(HttpStatus.CREATED).body(mapper.toResponse(order));
     }
 

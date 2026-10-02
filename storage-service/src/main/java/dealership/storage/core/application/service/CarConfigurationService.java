@@ -13,9 +13,14 @@ import dealership.storage.core.domain.exception.IncompatibleComponentException;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 @Service
 public class CarConfigurationService {
@@ -30,11 +35,13 @@ public class CarConfigurationService {
     }
 
     public ConfigurationResultDto configure(CarConfigurationRequestDto request) {
-        CarModel carModel = carModelRepository.findById(request.getCarModelId());
-        validateRequiredCategories(carModel, request);
-        List<ComponentVariant> selectedComponents = validateAndCollectComponents(carModel, request);
+        NormalizedRequest normalized = normalize(request);
+        CarModel carModel = carModelRepository.findById(normalized.carModelId());
+        validateRequiredCategories(carModel, normalized.selectedVariants());
+        List<ComponentVariant> selectedComponents = validateAndCollectComponents(
+                carModel, normalized.selectedVariants());
         CarConfiguration configuration = new CarConfiguration(carModel.getId());
-        request.getSelectedVariants().forEach(configuration::selectVariant);
+        normalized.selectedVariants().forEach(configuration::selectVariant);
 
         BigDecimal totalPrice = calculateTotalPrice(carModel, selectedComponents);
 
@@ -50,36 +57,43 @@ public class CarConfigurationService {
     }
 
 
-    private void validateRequiredCategories(CarModel carModel, CarConfigurationRequestDto request) {
-        Set<String> requiredCategories = carModel.getComponentCategoryIds();
-        Set<String> selectedCategories = request.getSelectedVariants().keySet();
+    private void validateRequiredCategories(CarModel carModel, Map<String, String> selectedVariants) {
+        Set<String> requiredCategories = new LinkedHashSet<>();
+        for (String categoryId : carModel.getComponentCategoryIds()) {
+            String canonical = canonicalUuid(categoryId, "categoryId");
+            componentCategoryRepository.findById(canonical);
+            requiredCategories.add(canonical);
+        }
+        Set<String> selectedCategories = selectedVariants.keySet();
 
-        List<String> missingCategories = requiredCategories.stream().filter(categoryId -> !selectedCategories.contains(categoryId)).map(categoryId -> {
-            try {
-                return componentCategoryRepository.findById(categoryId).getName();
-            } catch (Exception e) {
-                return categoryId;
-            }
-        }).toList();
-
-        if (!missingCategories.isEmpty()) {
-            throw new DomainValidationException("Отсутствуют обязательные узлы: " + String.join(", ", missingCategories));
+        Set<String> missing = new LinkedHashSet<>(requiredCategories);
+        missing.removeAll(selectedCategories);
+        Set<String> extra = new LinkedHashSet<>(selectedCategories);
+        extra.removeAll(requiredCategories);
+        if (!missing.isEmpty() || !extra.isEmpty()) {
+            throw new DomainValidationException(
+                    "Набор категорий должен точно соответствовать модели; отсутствуют: %s; лишние: %s"
+                            .formatted(missing, extra));
         }
     }
 
-    private List<ComponentVariant> validateAndCollectComponents(CarModel carModel, CarConfigurationRequestDto request) {
+    private List<ComponentVariant> validateAndCollectComponents(CarModel carModel,
+                                                                Map<String, String> selectedVariants) {
         List<ComponentVariant> selectedComponents = new ArrayList<>();
 
-        for (var entry : request.getSelectedVariants().entrySet()) {
+        for (var entry : selectedVariants.entrySet()) {
             String categoryId = entry.getKey();
             String variantId = entry.getValue();
 
             ComponentVariant variant = componentVariantRepository.findById(variantId);
-            if (!variant.getCategoryId().equals(categoryId)) {
+            if (!canonicalUuid(variant.getCategoryId(), "variant.categoryId").equals(categoryId)) {
                 throw new DomainValidationException("Вариант " + variant.getName() + " не принадлежит указанной категории");
             }
 
-            if (!variant.isCompatibleWith(carModel.getId())) {
+            boolean compatible = variant.getCompatibleCarModelIds().stream()
+                    .map(id -> canonicalUuid(id, "compatibleCarModelId"))
+                    .anyMatch(carModel.getId()::equals);
+            if (!compatible) {
                 String categoryName = componentCategoryRepository.findById(categoryId).getName();
                 throw new IncompatibleComponentException(String.format("Выбранный компонент '%s' (категория: %s) недоступен для модели %s", variant.getName(), categoryName, carModel.getFullModelName()));
             }
@@ -94,8 +108,44 @@ public class CarConfigurationService {
         for (ComponentVariant variant : selectedComponents) {
             totalPrice = totalPrice.add(variant.getPriceAdjustment());
         }
-        return totalPrice;
+        try {
+            BigDecimal normalized = totalPrice.setScale(2, RoundingMode.UNNECESSARY);
+            if (normalized.signum() <= 0 || normalized.precision() > 15) {
+                throw new DomainValidationException("Итоговая цена должна быть положительной и помещаться в DECIMAL(15,2)");
+            }
+            return normalized;
+        } catch (ArithmeticException exception) {
+            throw new DomainValidationException("Итоговая цена должна иметь не более двух знаков после запятой");
+        }
     }
 
+    private NormalizedRequest normalize(CarConfigurationRequestDto request) {
+        if (request == null) {
+            throw new DomainValidationException("Конфигурация не может быть null");
+        }
+        String carModelId = canonicalUuid(request.getCarModelId(), "carModelId");
+        if (request.getSelectedVariants() == null) {
+            throw new DomainValidationException("selectedVariants не может быть null");
+        }
+        Map<String, String> selectedVariants = new LinkedHashMap<>();
+        request.getSelectedVariants().forEach((rawCategory, rawVariant) -> {
+            String category = canonicalUuid(rawCategory, "categoryId");
+            String variant = canonicalUuid(rawVariant, "variantId");
+            if (selectedVariants.putIfAbsent(category, variant) != null) {
+                throw new DomainValidationException("Категория указана более одного раза: " + category);
+            }
+        });
+        return new NormalizedRequest(carModelId, Map.copyOf(selectedVariants));
+    }
 
+    private String canonicalUuid(String value, String field) {
+        try {
+            return UUID.fromString(value).toString();
+        } catch (RuntimeException exception) {
+            throw new DomainValidationException(field + " должен быть UUID");
+        }
+    }
+
+    private record NormalizedRequest(String carModelId, Map<String, String> selectedVariants) {
+    }
 }

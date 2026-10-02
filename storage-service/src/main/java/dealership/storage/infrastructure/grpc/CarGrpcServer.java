@@ -9,11 +9,18 @@ import dealership.common.grpc.ConfirmCarRequest;
 import dealership.common.grpc.ReleaseCarRequest;
 import dealership.common.grpc.ReservationResponse;
 import dealership.common.grpc.ReserveCarRequest;
+import dealership.common.grpc.QuoteConfigurationRequest;
+import dealership.common.grpc.QuoteConfigurationResponse;
+import dealership.storage.core.application.dto.CarConfigurationRequestDto;
+import dealership.storage.core.application.dto.ConfigurationResultDto;
+import dealership.storage.core.application.service.CarConfigurationService;
 import dealership.storage.core.application.service.CarReservationService;
 import dealership.storage.core.application.service.CarSearchService;
 import dealership.storage.core.domain.entity.car.Car;
 import dealership.storage.core.domain.exception.CarReservationConflictException;
 import dealership.storage.core.domain.exception.EntityNotFoundException;
+import dealership.storage.core.domain.exception.DomainValidationException;
+import dealership.storage.core.domain.exception.IncompatibleComponentException;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import net.devh.boot.grpc.server.service.GrpcService;
@@ -30,11 +37,45 @@ public class CarGrpcServer extends CarGrpcServiceGrpc.CarGrpcServiceImplBase {
 
     private final CarSearchService carSearchService;
     private final CarReservationService carReservationService;
+    private final CarConfigurationService carConfigurationService;
 
     public CarGrpcServer(CarSearchService carSearchService,
-                         CarReservationService carReservationService) {
+                         CarReservationService carReservationService,
+                         CarConfigurationService carConfigurationService) {
         this.carSearchService = carSearchService;
         this.carReservationService = carReservationService;
+        this.carConfigurationService = carConfigurationService;
+    }
+
+    @Override
+    public void quoteConfiguration(QuoteConfigurationRequest request,
+                                   StreamObserver<QuoteConfigurationResponse> responseObserver) {
+        try {
+            CarConfigurationRequestDto configurationRequest =
+                    new CarConfigurationRequestDto(request.getCarModelId());
+            configurationRequest.setSelectedVariants(request.getSelectedVariantsMap());
+            ConfigurationResultDto quote = carConfigurationService.configure(configurationRequest);
+            responseObserver.onNext(QuoteConfigurationResponse.newBuilder()
+                    .setCarModelId(quote.getConfiguration().getCarModelId())
+                    .putAllSelectedVariants(quote.getConfiguration().getSelectedVariants())
+                    .setTotalPrice(quote.getTotalPrice().toPlainString())
+                    .build());
+            responseObserver.onCompleted();
+        } catch (DomainValidationException | IllegalArgumentException exception) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription(exception.getMessage()).asRuntimeException());
+        } catch (EntityNotFoundException exception) {
+            responseObserver.onError(Status.NOT_FOUND
+                    .withDescription(exception.getMessage()).asRuntimeException());
+        } catch (IncompatibleComponentException exception) {
+            responseObserver.onError(Status.FAILED_PRECONDITION
+                    .withDescription(exception.getMessage()).asRuntimeException());
+        } catch (Exception exception) {
+            log.error("gRPC: Failed to quote configuration for model id={}",
+                    request.getCarModelId(), exception);
+            responseObserver.onError(Status.INTERNAL
+                    .withDescription("Failed to quote configuration").asRuntimeException());
+        }
     }
 
     @Override

@@ -7,3 +7,5 @@ databaseChangeLog:
       file: db/changelog/003-create-stock-reservation-workflows.sql
   - include:
       file: db/changelog/004-reliable-messaging.sql
+  - include:
+      file: db/changelog/005-prevent-test-drive-overlap.sql

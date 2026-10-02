@@ -81,6 +81,8 @@ reservation:
   recovery:
     interval: PT10S
     batch-size: 100
+business:
+  time-zone: Europe/Moscow
 grpc:
   client:
     storage-service:

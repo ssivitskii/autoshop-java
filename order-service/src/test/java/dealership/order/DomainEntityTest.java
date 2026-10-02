@@ -90,6 +90,22 @@ class DomainEntityTest {
             CustomOrder order = new CustomOrder("cl", "m", "model-1", config, new BigDecimal("5000000"));
             assertNotNull(order.getId());
             assertEquals(CustomOrderStatus.CREATED, order.getStatus());
+            assertEquals("cl", order.getClientId());
+            assertEquals("m", order.getManagerId());
+        }
+
+        @Test
+        @DisplayName("legacy zero price rehydrates, but model mismatch is rejected")
+        void shouldPreserveLegacyZeroPriceAndModelInvariant() {
+            CarConfiguration config = new CarConfiguration("model-1");
+            CustomOrder legacy = new CustomOrder(
+                    "id", "manager", "client", "model-1", config, BigDecimal.ZERO);
+            assertEquals(BigDecimal.ZERO, legacy.getTotalPrice());
+            assertEquals("client", legacy.getClientId());
+            assertEquals("manager", legacy.getManagerId());
+
+            assertThrows(DomainValidationException.class, () -> new CustomOrder(
+                    "client", "manager", "model-2", config, BigDecimal.ONE));
         }
 
         @Test

@@ -2,6 +2,7 @@ package dealership.order.core.application.service;
 
 import dealership.common.event.OrderSentForApprovalEvent;
 import dealership.order.core.application.port.out.CustomOrderRepository;
+import dealership.order.core.application.port.out.CustomConfigurationGateway;
 import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.domain.entity.car.CarConfiguration;
 import dealership.order.core.domain.entity.order.CustomOrder;
@@ -23,22 +24,28 @@ public class CustomOrderService {
     private final CustomOrderRepository orderRepository;
     private final UserRepository userRepository;
     private final OrderEventProducer eventProducer;
+    private final CustomConfigurationGateway configurationGateway;
     private final Random random = new Random();
 
     public CustomOrderService(CustomOrderRepository orderRepository,
                               UserRepository userRepository,
-                              OrderEventProducer eventProducer) {
+                              OrderEventProducer eventProducer,
+                              CustomConfigurationGateway configurationGateway) {
         this.orderRepository = orderRepository;
         this.userRepository = userRepository;
         this.eventProducer = eventProducer;
+        this.configurationGateway = configurationGateway;
     }
 
-    @Transactional
     public CustomOrder createOrder(String clientId, String carModelId,
-                                   CarConfiguration configuration, BigDecimal totalPrice) {
+                                   java.util.Map<String, String> selectedVariants) {
+        CustomConfigurationGateway.ConfigurationQuote quote =
+                configurationGateway.quote(carModelId, selectedVariants);
         String managerId = assignRandomManager();
+        CarConfiguration configuration = new CarConfiguration(quote.carModelId());
+        quote.selectedVariants().forEach(configuration::selectVariant);
         CustomOrder order = new CustomOrder(
-                null, managerId, clientId, carModelId, configuration, totalPrice);
+                null, managerId, clientId, quote.carModelId(), configuration, quote.totalPrice());
         return orderRepository.save(order);
     }
 
