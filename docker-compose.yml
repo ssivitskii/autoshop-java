@@ -142,8 +142,7 @@ services:
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: http://localhost:8180/realms/dealership
       SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_JWK_SET_URI: http://keycloak:8080/realms/dealership/protocol/openid-connect/certs
-      GRPC_CLIENT_STORAGE_SERVICE_ADDRESS: static://storage-service:9090
-      GRPC_CLIENT_STORAGE_SERVICE_NEGOTIATION_TYPE: plaintext
+      STORAGE_GRPC_ADDRESS: static://storage-service:9090
     ports: ["127.0.0.1:8081:8081"]
     mem_limit: 512m
     depends_on:

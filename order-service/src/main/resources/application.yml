@@ -84,6 +84,6 @@ reservation:
 grpc:
   client:
     storage-service:
-      address: static://localhost:9090
+      address: ${STORAGE_GRPC_ADDRESS:static://localhost:9090}
       negotiation-type: plaintext
       deadline-after: 5000
