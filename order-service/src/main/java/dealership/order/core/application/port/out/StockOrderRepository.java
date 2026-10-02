@@ -9,6 +9,8 @@ public interface StockOrderRepository {
 
     StockOrder findById(String id);
 
+    StockOrder findByIdForUpdate(String id);
+
     List<StockOrder> findAll();
 
     List<StockOrder> findByClientId(String clientId);

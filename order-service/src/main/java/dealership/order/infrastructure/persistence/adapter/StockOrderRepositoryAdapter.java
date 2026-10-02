@@ -33,6 +33,12 @@ public class StockOrderRepositoryAdapter implements StockOrderRepository {
     }
 
     @Override
+    public StockOrder findByIdForUpdate(String id) {
+        return jpaRepository.findByIdForUpdate(UUID.fromString(id)).map(mapper::toDomain)
+                .orElseThrow(() -> new EntityNotFoundException("Заказ с id '%s' не найден".formatted(id)));
+    }
+
+    @Override
     public List<StockOrder> findAll() {
         return jpaRepository.findByRemovedFalse().stream().map(mapper::toDomain).toList();
     }

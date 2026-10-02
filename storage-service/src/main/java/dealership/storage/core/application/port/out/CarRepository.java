@@ -23,4 +23,8 @@ public interface CarRepository {
     void deleteById(String id);
 
     boolean existsById(String id);
+
+    boolean reserve(String carId, String orderId);
+
+    void release(String carId, String orderId);
 }

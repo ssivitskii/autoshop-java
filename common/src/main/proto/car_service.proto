@@ -9,6 +9,8 @@ option java_outer_classname = "CarServiceProto";
 service CarGrpcService {
   rpc GetAvailableCars (GetAvailableCarsRequest) returns (GetAvailableCarsResponse);
   rpc GetCarById (GetCarByIdRequest) returns (CarDto);
+  rpc ReserveCar (ReserveCarRequest) returns (ReservationResponse);
+  rpc ReleaseCar (ReleaseCarRequest) returns (ReservationResponse);
 }
 
 message GetAvailableCarsRequest {
@@ -20,6 +22,20 @@ message GetAvailableCarsResponse {
 
 message GetCarByIdRequest {
   string id = 1;
+}
+
+message ReserveCarRequest {
+  string car_id = 1;
+  string order_id = 2;
+}
+
+message ReleaseCarRequest {
+  string car_id = 1;
+  string order_id = 2;
+}
+
+message ReservationResponse {
+  bool successful = 1;
 }
 
 message CarDto {

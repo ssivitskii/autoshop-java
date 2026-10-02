@@ -5,6 +5,7 @@ import dealership.common.event.OrderApprovedEvent;
 import dealership.common.event.OrderRejectedEvent;
 import dealership.order.core.application.service.CustomOrderService;
 import dealership.order.core.application.service.StockOrderService;
+import dealership.order.core.domain.exception.StorageUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -41,6 +42,9 @@ public class OrderEventConsumer {
             } else {
                 log.warn("Unknown message on order.responses: {}", message);
             }
+        } catch (StorageUnavailableException e) {
+            log.warn("Storage unavailable while processing order response; message will be retried", e);
+            throw e;
         } catch (Exception e) {
             log.error("Failed to process order response: {}", message, e);
         }

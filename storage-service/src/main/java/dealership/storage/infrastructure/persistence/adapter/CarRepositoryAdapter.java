@@ -9,6 +9,7 @@ import dealership.storage.infrastructure.persistence.mapper.CarPersistenceMapper
 import dealership.storage.infrastructure.persistence.repository.CarJpaRepository;
 import dealership.storage.infrastructure.persistence.specification.CarSpecification;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.Optional;
@@ -67,5 +68,21 @@ public class CarRepositoryAdapter implements CarRepository {
     @Override
     public boolean existsById(String id) {
         return jpaRepository.existsByIdAndRemovedFalse(UUID.fromString(id));
+    }
+
+    @Override
+    @Transactional
+    public boolean reserve(String carId, String orderId) {
+        return jpaRepository.reserve(UUID.fromString(carId), UUID.fromString(orderId)) == 1;
+    }
+
+    @Override
+    @Transactional
+    public void release(String carId, String orderId) {
+        UUID carUuid = UUID.fromString(carId);
+        jpaRepository.release(carUuid, UUID.fromString(orderId));
+        if (!jpaRepository.existsByIdAndRemovedFalse(carUuid)) {
+            throw new EntityNotFoundException("Автомобиль с id '%s' не найден".formatted(carId));
+        }
     }
 }

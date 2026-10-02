@@ -5,19 +5,29 @@ import dealership.common.event.OrderSentForApprovalEvent;
 import dealership.storage.core.application.port.out.AssemblyOrderRepository;
 import dealership.storage.core.application.port.out.CarRepository;
 import dealership.storage.core.application.service.AssemblyOrderService;
+import dealership.storage.core.application.service.CarReservationService;
 import dealership.storage.core.domain.entity.assembly.AssemblyOrder;
 import dealership.storage.core.domain.entity.car.Car;
 import dealership.storage.core.domain.enums.*;
+import dealership.storage.core.domain.exception.CarReservationConflictException;
+import dealership.storage.core.domain.exception.EntityNotFoundException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
@@ -44,6 +54,12 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
 
     @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Autowired
+    private CarReservationService carReservationService;
+
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
 
     @Test
     @DisplayName("Liquibase миграции: таблицы и seed data")
@@ -126,6 +142,101 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
     }
 
     @Test
+    @DisplayName("Резервирование: из двух одновременных заказов побеждает ровно один")
+    void shouldAllowExactlyOneConcurrentReservation() throws Exception {
+        Car car = saveAvailableCar();
+        String firstOrder = UUID.randomUUID().toString();
+        String secondOrder = UUID.randomUUID().toString();
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<Boolean> first = executor.submit(() -> tryReserveTogether(car.getId(), firstOrder, ready, start));
+            Future<Boolean> second = executor.submit(() -> tryReserveTogether(car.getId(), secondOrder, ready, start));
+            boolean allWorkersReady = ready.await(10, TimeUnit.SECONDS);
+            start.countDown();
+            assertTrue(allWorkersReady);
+
+            assertEquals(1, (first.get(10, TimeUnit.SECONDS) ? 1 : 0)
+                    + (second.get(10, TimeUnit.SECONDS) ? 1 : 0));
+        }
+
+        assertFalse(carRepository.findAvailable().stream().anyMatch(item -> item.getId().equals(car.getId())));
+        assertTrue(List.of(firstOrder, secondOrder).contains(reservedBy(car.getId())));
+    }
+
+    @Test
+    @DisplayName("Резервирование: отмена освобождает автомобиль для нового заказа")
+    void shouldReleaseAndRebookCar() {
+        Car car = saveAvailableCar();
+        String firstOrder = UUID.randomUUID().toString();
+        String secondOrder = UUID.randomUUID().toString();
+
+        carReservationService.reserve(car.getId(), firstOrder);
+        carReservationService.release(car.getId(), firstOrder);
+        carReservationService.reserve(car.getId(), secondOrder);
+        carReservationService.release(car.getId(), firstOrder);
+
+        assertEquals(secondOrder, reservedBy(car.getId()));
+        assertFalse(carRepository.findById(car.getId()).isAvailable());
+    }
+
+    @Test
+    @DisplayName("Резервирование: повтор владельца идемпотентен, чужое освобождение безопасно")
+    void shouldKeepReservationOnRetryAndForeignRelease() {
+        Car car = saveAvailableCar();
+        String owner = UUID.randomUUID().toString();
+
+        carReservationService.reserve(car.getId(), owner);
+        carReservationService.reserve(car.getId(), owner);
+        carReservationService.release(car.getId(), UUID.randomUUID().toString());
+
+        assertEquals(owner, reservedBy(car.getId()));
+        assertFalse(carRepository.findById(car.getId()).isAvailable());
+    }
+
+    @Test
+    @DisplayName("Резервирование: устаревшее сохранение каталога не открывает удерживаемый автомобиль")
+    void shouldRejectStaleCatalogueSave() {
+        Car staleCar = saveAvailableCar();
+        String owner = UUID.randomUUID().toString();
+        carReservationService.reserve(staleCar.getId(), owner);
+
+        assertThrows(RuntimeException.class, () -> carRepository.save(staleCar));
+
+        assertEquals(owner, reservedBy(staleCar.getId()));
+        assertFalse(carRepository.findById(staleCar.getId()).isAvailable());
+    }
+
+    @Test
+    @DisplayName("Резервирование: отсутствующий и недоступный автомобили различаются")
+    void shouldDistinguishMissingAndUnavailableCars() {
+        assertThrows(EntityNotFoundException.class,
+                () -> carReservationService.reserve(UUID.randomUUID().toString(), UUID.randomUUID().toString()));
+
+        Car unavailable = saveAvailableCar();
+        unavailable.markAsUnavailable();
+        carRepository.save(unavailable);
+        assertThrows(CarReservationConflictException.class,
+                () -> carReservationService.reserve(unavailable.getId(), UUID.randomUUID().toString()));
+    }
+
+    @Test
+    @DisplayName("Резервирование: один заказ не может удерживать два автомобиля")
+    void shouldRejectSecondCarForSameOrder() {
+        Car firstCar = saveAvailableCar();
+        Car secondCar = saveAvailableCar();
+        String orderId = UUID.randomUUID().toString();
+        carReservationService.reserve(firstCar.getId(), orderId);
+
+        assertThrows(CarReservationConflictException.class,
+                () -> carReservationService.reserve(secondCar.getId(), orderId));
+
+        assertTrue(carRepository.findById(secondCar.getId()).isAvailable());
+        assertNull(reservedBy(secondCar.getId()));
+    }
+
+    @Test
     @WithMockUser(roles = "WAREHOUSE_ADMIN")
     @DisplayName("REST: WAREHOUSE_ADMIN может видеть запчасти")
     void shouldAllowWarehouseAdminParts() throws Exception {
@@ -139,5 +250,33 @@ class StorageServiceIntegrationTest extends BaseIntegrationTest {
     void shouldDenyUserInventory() throws Exception {
         mockMvc.perform(get("/api/inventory/parts"))
                 .andExpect(status().isForbidden());
+    }
+
+    private boolean tryReserveTogether(String carId, String orderId,
+                                       CountDownLatch ready, CountDownLatch start) throws InterruptedException {
+        ready.countDown();
+        if (!start.await(10, TimeUnit.SECONDS)) {
+            return false;
+        }
+        try {
+            carReservationService.reserve(carId, orderId);
+            return true;
+        } catch (CarReservationConflictException exception) {
+            return false;
+        }
+    }
+
+    private Car saveAvailableCar() {
+        return carRepository.save(new Car(
+                "Test", "Reservation", BodyType.SEDAN, FuelType.PETROL,
+                150, 2.0, TransmissionType.AUTOMATIC, DriveType.FRONT,
+                Color.BLACK, new BigDecimal("1000000")));
+    }
+
+    private String reservedBy(String carId) {
+        UUID owner = jdbcTemplate.queryForObject(
+                "SELECT reserved_by_order_id FROM cars WHERE id = ?",
+                UUID.class, UUID.fromString(carId));
+        return owner == null ? null : owner.toString();
     }
 }

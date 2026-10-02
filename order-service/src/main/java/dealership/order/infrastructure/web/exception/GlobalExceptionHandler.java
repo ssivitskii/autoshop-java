@@ -3,6 +3,8 @@ package dealership.order.infrastructure.web.exception;
 import dealership.order.core.domain.exception.DomainValidationException;
 import dealership.order.core.domain.exception.EntityNotFoundException;
 import dealership.order.core.domain.exception.IncompatibleComponentException;
+import dealership.order.core.domain.exception.CarReservationConflictException;
+import dealership.order.core.domain.exception.StorageUnavailableException;
 import dealership.order.infrastructure.web.dto.response.ErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -46,6 +48,28 @@ public class GlobalExceptionHandler {
                 Instant.now()
         );
         return ResponseEntity.status(HttpStatus.CONFLICT).body(error);
+    }
+
+    @ExceptionHandler(CarReservationConflictException.class)
+    public ResponseEntity<ErrorResponse> handleReservationConflict(CarReservationConflictException ex) {
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.CONFLICT.value(),
+                "Reservation Conflict",
+                ex.getMessage(),
+                Instant.now()
+        );
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(error);
+    }
+
+    @ExceptionHandler(StorageUnavailableException.class)
+    public ResponseEntity<ErrorResponse> handleStorageUnavailable(StorageUnavailableException ex) {
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.SERVICE_UNAVAILABLE.value(),
+                "Storage Unavailable",
+                ex.getMessage(),
+                Instant.now()
+        );
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).body(error);
     }
 
     @ExceptionHandler(AccessDeniedException.class)
