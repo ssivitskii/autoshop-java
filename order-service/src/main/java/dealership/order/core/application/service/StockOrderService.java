@@ -7,6 +7,7 @@ import dealership.order.core.domain.entity.order.StockOrder;
 import dealership.order.core.domain.entity.user.User;
 import dealership.order.core.domain.enums.UserRole;
 import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.StorageUnavailableException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -24,31 +25,36 @@ public class StockOrderService {
     private final UserRepository userRepository;
     private final StockCarReservationGateway reservationGateway;
     private final StockOrderTransactions transactions;
+    private final StockReservationRecoveryService recoveryService;
     private final Random random = new Random();
 
     public StockOrderService(StockOrderRepository orderRepository,
                              UserRepository userRepository,
                              StockCarReservationGateway reservationGateway,
-                             StockOrderTransactions transactions) {
+                             StockOrderTransactions transactions,
+                             StockReservationRecoveryService recoveryService) {
         this.orderRepository = orderRepository;
         this.userRepository = userRepository;
         this.reservationGateway = reservationGateway;
         this.transactions = transactions;
+        this.recoveryService = recoveryService;
     }
 
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public StockOrder createOrder(String clientId, String carId) {
         String managerId = assignRandomManager();
         StockOrder order = new StockOrder(null, clientId, managerId, carId);
+        StockCarReservationGateway.ReservationLease lease;
         try {
-            reservationGateway.reserve(carId, order.getId());
-        } catch (RuntimeException exception) {
+            lease = reservationGateway.reserve(carId, order.getId());
+        } catch (StorageUnavailableException exception) {
             releaseAfterFailure(order, exception);
             throw exception;
+        } catch (RuntimeException exception) {
+            throw exception;
         }
-
         try {
-            return transactions.saveNew(order);
+            return transactions.saveNew(order, lease.expiresAt());
         } catch (RuntimeException exception) {
             releaseAfterFailure(order, exception);
             throw exception;
@@ -61,13 +67,12 @@ public class StockOrderService {
 
     @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public StockOrder cancelOrder(String orderId) {
-        StockOrder cancelled = transactions.cancel(orderId);
-        reservationGateway.release(cancelled.getCarId(), cancelled.getId());
-        return cancelled;
+        return recoveryService.execute(transactions.cancel(orderId));
     }
 
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
     public StockOrder advanceOrder(String orderId) {
-        return transactions.advance(orderId);
+        return recoveryService.execute(transactions.advance(orderId));
     }
 
     public List<StockOrder> getClientOrders(String clientId) {

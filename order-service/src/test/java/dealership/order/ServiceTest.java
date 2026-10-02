@@ -8,6 +8,7 @@ import dealership.order.core.application.port.out.UserRepository;
 import dealership.order.core.application.service.CustomOrderService;
 import dealership.order.core.application.service.StockOrderService;
 import dealership.order.core.application.service.StockOrderTransactions;
+import dealership.order.core.application.service.StockReservationRecoveryService;
 import dealership.order.core.application.service.TestDriveService;
 import dealership.order.core.domain.entity.car.CarConfiguration;
 import dealership.order.core.domain.entity.order.CustomOrder;
@@ -16,10 +17,14 @@ import dealership.order.core.domain.entity.testdrive.TestDriveRequest;
 import dealership.order.core.domain.entity.user.User;
 import dealership.order.core.domain.enums.CustomOrderStatus;
 import dealership.order.core.domain.enums.StockOrderStatus;
+import dealership.order.core.domain.enums.StockReservationWorkflowState;
 import dealership.order.core.domain.enums.TestDriveStatus;
 import dealership.order.core.domain.enums.UserRole;
 import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.StorageUnavailableException;
 import dealership.order.infrastructure.messaging.OrderEventProducer;
+import dealership.order.infrastructure.persistence.entity.StockReservationWorkflowJpaEntity;
+import dealership.order.infrastructure.persistence.repository.StockReservationWorkflowJpaRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -32,7 +37,10 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -54,6 +62,8 @@ class ServiceTest {
         private StockCarReservationGateway reservationGateway;
         @Mock
         private StockOrderTransactions transactions;
+        @Mock
+        private StockReservationRecoveryService recoveryService;
         @InjectMocks
         private StockOrderService orderService;
 
@@ -67,8 +77,12 @@ class ServiceTest {
         @Test
         @DisplayName("создание заказа: менеджер назначается")
         void shouldCreateOrder() {
+            Instant expiry = Instant.now().plusSeconds(60);
             when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
-            when(transactions.saveNew(any(StockOrder.class))).thenAnswer(inv -> inv.getArgument(0));
+            when(reservationGateway.reserve(eq("car-1"), anyString()))
+                    .thenReturn(new StockCarReservationGateway.ReservationLease(expiry));
+            when(transactions.saveNew(any(StockOrder.class), eq(expiry)))
+                    .thenAnswer(inv -> inv.getArgument(0));
 
             StockOrder order = orderService.createOrder("client-1", "car-1");
             assertNotNull(order.getId());
@@ -76,7 +90,7 @@ class ServiceTest {
             assertEquals(StockOrderStatus.CREATED, order.getStatus());
             InOrder inOrder = inOrder(reservationGateway, transactions);
             inOrder.verify(reservationGateway).reserve("car-1", order.getId());
-            inOrder.verify(transactions).saveNew(any());
+            inOrder.verify(transactions).saveNew(any(), eq(expiry));
         }
 
         @Test
@@ -91,13 +105,16 @@ class ServiceTest {
         void shouldCancelOrder() {
             StockOrder order = new StockOrder("cl", "m", "car");
             order.cancel();
-            when(transactions.cancel(order.getId())).thenReturn(order);
+            StockOrderTransactions.Work work =
+                    new StockOrderTransactions.Work(order, StockOrderTransactions.Action.RELEASE);
+            when(transactions.cancel(order.getId())).thenReturn(work);
+            when(recoveryService.execute(work)).thenReturn(order);
 
             StockOrder cancelled = orderService.cancelOrder(order.getId());
             assertEquals(StockOrderStatus.CANCELLED, cancelled.getStatus());
-            InOrder inOrder = inOrder(transactions, reservationGateway);
+            InOrder inOrder = inOrder(transactions, recoveryService);
             inOrder.verify(transactions).cancel(order.getId());
-            inOrder.verify(reservationGateway).release(order.getCarId(), order.getId());
+            inOrder.verify(recoveryService).execute(work);
         }
 
         @Test
@@ -108,7 +125,10 @@ class ServiceTest {
             order.advanceStatus();
             order.advanceStatus();
 
-            when(transactions.advance(order.getId())).thenReturn(order);
+            StockOrderTransactions.Work work =
+                    new StockOrderTransactions.Work(order, StockOrderTransactions.Action.NONE);
+            when(transactions.advance(order.getId())).thenReturn(work);
+            when(recoveryService.execute(work)).thenReturn(order);
 
             StockOrder advanced = orderService.advanceOrder(order.getId());
             assertEquals(StockOrderStatus.PAID, advanced.getStatus());
@@ -118,8 +138,11 @@ class ServiceTest {
         @Test
         @DisplayName("ошибка локального сохранения компенсирует резерв")
         void shouldReleaseReservationWhenSaveFails() {
+            Instant expiry = Instant.now().plusSeconds(60);
             when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
-            when(transactions.saveNew(any())).thenThrow(new RuntimeException("db down"));
+            when(reservationGateway.reserve(eq("car"), anyString()))
+                    .thenReturn(new StockCarReservationGateway.ReservationLease(expiry));
+            when(transactions.saveNew(any(), eq(expiry))).thenThrow(new RuntimeException("db down"));
 
             assertThrows(RuntimeException.class, () -> orderService.createOrder("cl", "car"));
             var orderId = org.mockito.ArgumentCaptor.forClass(String.class);
@@ -132,20 +155,21 @@ class ServiceTest {
         void shouldNotSaveWhenReservationFails() {
             when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
             RuntimeException conflict = new RuntimeException("conflict");
-            doThrow(conflict).when(reservationGateway).reserve(eq("car"), anyString());
+            when(reservationGateway.reserve(eq("car"), anyString())).thenThrow(conflict);
 
             assertSame(conflict, assertThrows(RuntimeException.class,
                     () -> orderService.createOrder("cl", "car")));
-            verify(transactions, never()).saveNew(any());
+            verify(transactions, never()).saveNew(any(), any());
+            verify(reservationGateway, never()).release(anyString(), anyString());
         }
 
         @Test
         @DisplayName("ошибка компенсации не скрывает исходную ошибку")
         void shouldPreserveOriginalFailureWhenCleanupFails() {
             when(userRepository.findByRole(UserRole.MANAGER)).thenReturn(List.of(testManager));
-            RuntimeException original = new RuntimeException("reserve uncertain");
+            RuntimeException original = new StorageUnavailableException("reserve uncertain", null);
             RuntimeException cleanup = new RuntimeException("cleanup failed");
-            doThrow(original).when(reservationGateway).reserve(eq("car"), anyString());
+            when(reservationGateway.reserve(eq("car"), anyString())).thenThrow(original);
             doThrow(cleanup).when(reservationGateway).release(eq("car"), anyString());
 
             RuntimeException thrown = assertThrows(RuntimeException.class,
@@ -169,12 +193,15 @@ class ServiceTest {
         void shouldRetryReleaseForAlreadyCancelledOrder() {
             StockOrder cancelled = new StockOrder("cl", "m", "car");
             cancelled.cancel();
-            when(transactions.cancel(cancelled.getId())).thenReturn(cancelled);
+            StockOrderTransactions.Work work =
+                    new StockOrderTransactions.Work(cancelled, StockOrderTransactions.Action.RELEASE);
+            when(transactions.cancel(cancelled.getId())).thenReturn(work);
+            when(recoveryService.execute(work)).thenReturn(cancelled);
 
             orderService.cancelOrder(cancelled.getId());
             orderService.cancelOrder(cancelled.getId());
 
-            verify(reservationGateway, times(2)).release(cancelled.getCarId(), cancelled.getId());
+            verify(recoveryService, times(2)).execute(work);
         }
 
         @Test
@@ -196,6 +223,8 @@ class ServiceTest {
         private StockOrderRepository orderRepository;
         @Mock
         private OrderEventProducer eventProducer;
+        @Mock
+        private StockReservationWorkflowJpaRepository workflowRepository;
         @InjectMocks
         private StockOrderTransactions transactions;
 
@@ -205,10 +234,13 @@ class ServiceTest {
             StockOrder order = new StockOrder("cl", "m", "car");
             order.advanceStatus();
             order.advanceStatus();
+            StockReservationWorkflowJpaEntity workflow = workflow(order, StockReservationWorkflowState.CONFIRM_PENDING);
             when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(workflowRepository.findByOrderIdForUpdate(UUID.fromString(order.getId())))
+                    .thenReturn(Optional.of(workflow));
             when(orderRepository.save(order)).thenReturn(order);
 
-            StockOrder saved = transactions.advance(order.getId());
+            StockOrder saved = transactions.completeConfirmation(order.getId());
 
             assertEquals(StockOrderStatus.PAID, saved.getStatus());
             verify(orderRepository).findByIdForUpdate(order.getId());
@@ -219,7 +251,10 @@ class ServiceTest {
         @DisplayName("advance до промежуточного статуса не пишет outbox")
         void shouldNotPublishBeforePaid() {
             StockOrder order = new StockOrder("cl", "m", "car");
+            StockReservationWorkflowJpaEntity workflow = workflow(order, StockReservationWorkflowState.HELD);
             when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(workflowRepository.findByOrderIdForUpdate(UUID.fromString(order.getId())))
+                    .thenReturn(Optional.of(workflow));
             when(orderRepository.save(order)).thenReturn(order);
 
             transactions.advance(order.getId());
@@ -232,13 +267,26 @@ class ServiceTest {
         void shouldLockButNotRewriteAlreadyCancelledOrder() {
             StockOrder order = new StockOrder("cl", "m", "car");
             order.cancel();
+            StockReservationWorkflowJpaEntity workflow = workflow(order, StockReservationWorkflowState.RELEASE_PENDING);
             when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(workflowRepository.findByOrderIdForUpdate(UUID.fromString(order.getId())))
+                    .thenReturn(Optional.of(workflow));
+            when(workflowRepository.databaseNow()).thenReturn(Instant.now());
 
-            StockOrder result = transactions.cancel(order.getId());
+            StockOrderTransactions.Work result = transactions.cancel(order.getId());
 
-            assertSame(order, result);
+            assertSame(order, result.order());
             verify(orderRepository).findByIdForUpdate(order.getId());
             verify(orderRepository, never()).save(any());
+        }
+
+        private StockReservationWorkflowJpaEntity workflow(
+                StockOrder order, StockReservationWorkflowState state) {
+            StockReservationWorkflowJpaEntity workflow = new StockReservationWorkflowJpaEntity();
+            workflow.setOrderId(UUID.fromString(order.getId()));
+            workflow.setCarId(order.getCarId());
+            workflow.setState(state);
+            return workflow;
         }
     }
 

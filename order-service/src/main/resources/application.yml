@@ -58,6 +58,10 @@ server:
 outbox:
   scheduler:
     rate: 5000
+reservation:
+  recovery:
+    interval: PT10S
+    batch-size: 100
 grpc:
   client:
     storage-service:

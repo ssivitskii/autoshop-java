@@ -5,6 +5,7 @@ import dealership.common.grpc.CarGrpcServiceGrpc;
 import dealership.common.grpc.GetAvailableCarsRequest;
 import dealership.common.grpc.GetAvailableCarsResponse;
 import dealership.common.grpc.GetCarByIdRequest;
+import dealership.common.grpc.ConfirmCarRequest;
 import dealership.common.grpc.ReleaseCarRequest;
 import dealership.common.grpc.ReservationResponse;
 import dealership.common.grpc.ReserveCarRequest;
@@ -40,8 +41,13 @@ public class CarGrpcServer extends CarGrpcServiceGrpc.CarGrpcServiceImplBase {
     public void reserveCar(ReserveCarRequest request,
                            StreamObserver<ReservationResponse> responseObserver) {
         try {
-            carReservationService.reserve(request.getCarId(), request.getOrderId());
-            responseObserver.onNext(ReservationResponse.newBuilder().setSuccessful(true).build());
+            CarReservationService.ReservationLease lease =
+                    carReservationService.reserve(request.getCarId(), request.getOrderId());
+            ReservationResponse.Builder response = ReservationResponse.newBuilder().setSuccessful(true);
+            if (lease.expiresAt() != null) {
+                response.setExpiresAtEpochMillis(lease.expiresAt().toEpochMilli());
+            }
+            responseObserver.onNext(response.build());
             responseObserver.onCompleted();
         } catch (IllegalArgumentException e) {
             responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
@@ -61,6 +67,33 @@ public class CarGrpcServer extends CarGrpcServiceGrpc.CarGrpcServiceImplBase {
     }
 
     @Override
+    public void confirmCar(ConfirmCarRequest request,
+                           StreamObserver<ReservationResponse> responseObserver) {
+        try {
+            CarReservationService.ConfirmationResult result =
+                    carReservationService.confirm(request.getCarId(), request.getOrderId());
+            if (result != CarReservationService.ConfirmationResult.CONFIRMED) {
+                responseObserver.onError(Status.FAILED_PRECONDITION
+                        .withDescription("Reservation is no longer confirmable")
+                        .asRuntimeException());
+                return;
+            }
+            responseObserver.onNext(ReservationResponse.newBuilder().setSuccessful(true).build());
+            responseObserver.onCompleted();
+        } catch (IllegalArgumentException e) {
+            responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
+        } catch (EntityNotFoundException e) {
+            responseObserver.onError(Status.NOT_FOUND.withDescription(e.getMessage()).asRuntimeException());
+        } catch (CarReservationConflictException e) {
+            responseObserver.onError(Status.FAILED_PRECONDITION.withDescription(e.getMessage()).asRuntimeException());
+        } catch (Exception e) {
+            log.error("gRPC: Failed to confirm car id={} for order id={}",
+                    request.getCarId(), request.getOrderId(), e);
+            responseObserver.onError(Status.INTERNAL.withDescription("Failed to confirm car").asRuntimeException());
+        }
+    }
+
+    @Override
     public void releaseCar(ReleaseCarRequest request,
                            StreamObserver<ReservationResponse> responseObserver) {
         try {
@@ -71,6 +104,8 @@ public class CarGrpcServer extends CarGrpcServiceGrpc.CarGrpcServiceImplBase {
             responseObserver.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());
         } catch (EntityNotFoundException e) {
             responseObserver.onError(Status.NOT_FOUND.withDescription(e.getMessage()).asRuntimeException());
+        } catch (CarReservationConflictException e) {
+            responseObserver.onError(Status.FAILED_PRECONDITION.withDescription(e.getMessage()).asRuntimeException());
         } catch (Exception e) {
             log.error("gRPC: Failed to release car id={} for order id={}",
                     request.getCarId(), request.getOrderId(), e);

@@ -1,6 +1,7 @@
 package dealership.storage;
 
 import dealership.common.grpc.ReleaseCarRequest;
+import dealership.common.grpc.ConfirmCarRequest;
 import dealership.common.grpc.ReservationResponse;
 import dealership.common.grpc.ReserveCarRequest;
 import dealership.storage.core.application.service.CarReservationService;
@@ -65,6 +66,19 @@ class CarGrpcServerTest {
                 .setCarId("bad").setOrderId("bad").build(), observer);
 
         assertStatus(Status.Code.INVALID_ARGUMENT);
+    }
+
+    @Test
+    void confirmReportsDurablyExpiredReservationAsFailedPrecondition() {
+        String carId = UUID.randomUUID().toString();
+        String orderId = UUID.randomUUID().toString();
+        when(reservationService.confirm(carId, orderId))
+                .thenReturn(CarReservationService.ConfirmationResult.EXPIRED);
+
+        server.confirmCar(ConfirmCarRequest.newBuilder()
+                .setCarId(carId).setOrderId(orderId).build(), observer);
+
+        assertStatus(Status.Code.FAILED_PRECONDITION);
     }
 
     private ReserveCarRequest reserveRequest(String carId, String orderId) {

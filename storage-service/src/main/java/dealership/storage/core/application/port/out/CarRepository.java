@@ -27,4 +27,6 @@ public interface CarRepository {
     boolean reserve(String carId, String orderId);
 
     void release(String carId, String orderId);
+
+    void releaseIfOwned(String carId, String orderId);
 }

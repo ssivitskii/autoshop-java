@@ -10,6 +10,7 @@ service CarGrpcService {
   rpc GetAvailableCars (GetAvailableCarsRequest) returns (GetAvailableCarsResponse);
   rpc GetCarById (GetCarByIdRequest) returns (CarDto);
   rpc ReserveCar (ReserveCarRequest) returns (ReservationResponse);
+  rpc ConfirmCar (ConfirmCarRequest) returns (ReservationResponse);
   rpc ReleaseCar (ReleaseCarRequest) returns (ReservationResponse);
 }
 
@@ -34,8 +35,14 @@ message ReleaseCarRequest {
   string order_id = 2;
 }
 
+message ConfirmCarRequest {
+  string car_id = 1;
+  string order_id = 2;
+}
+
 message ReservationResponse {
   bool successful = 1;
+  int64 expires_at_epoch_millis = 2;
 }
 
 message CarDto {
