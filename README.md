@@ -43,7 +43,13 @@ Confirm и release сохраняются как durable intent в `stock_reserv
 
 При создании custom-заказа `order-service` синхронно получает у склада каноническую конфигурацию и рассчитанную цену, а затем сохраняет этот snapshot. Клиент обязан передать ровно по одному совместимому варианту для каждой категории модели. Старое поле `totalPrice` в REST-запросе оставлено только для совместимости и полностью игнорируется: подмена цены клиентом не влияет на заказ. Некорректные UUID и неполный/лишний набор категорий дают `400`, отсутствующая модель или компонент — `404`, несовместимый вариант — `409`, недоступный или некорректно ответивший склад — `503`.
 
+Оплата реализована только как управляемый вызывающей стороной **demo workflow simulator**. Он не принимает реквизиты карты или счёта, не списывает деньги, не обращается к платёжному провайдеру и не утверждает, что сумма реально оплачена. Клиент передаёт `SUCCESS` или `DECLINE`; durable receipt сохраняет выбранный исход и состояние workflow. Для каждого POST обязателен UUID-заголовок `Idempotency-Key`. Повтор того же ключа и исхода возвращает тот же receipt даже после последующего изменения заказа, а смена исхода для ключа возвращает `409`. `DECLINED` оставляет заказ в `AWAITING_PAYMENT` и разрешает новую попытку с новым ключом. Новый ключ отклоняется, пока есть `PENDING` или `SUCCEEDED`.
+
+Stock-заказ с `SUCCESS` сначала атомарно сохраняет `PENDING` и intent подтверждения резерва, затем вызывает склад без открытой транзакции БД. Временная ошибка оставляет receipt в `PENDING`: POST/GET возвращает `202`, а worker повторяет intent. Успешное подтверждение атомарно фиксирует `SUCCEEDED`, `PAID` и одно outbox-событие; terminal-ошибка резерва фиксирует `FAILED` и отменяет заказ. Custom-заказ фиксирует `SUCCEEDED`, `PAID` и outbox в одной локальной транзакции. Terminal receipts возвращаются с `200`. Существующая отмена уже оплаченного в demo заказе сохраняет `SUCCEEDED` как исторический исход; simulator не моделирует возврат средств или refund accounting.
+
 Запись на тест-драйв создаётся на фиксированный часовой интервал `[scheduledAt, scheduledAt + 1 час)`. Поэтому соседняя запись ровно с момента окончания разрешена, а любое пересечение для того же автомобиля возвращает `409`; это правило атомарно обеспечивает PostgreSQL и для конкурентных запросов. Время должно быть строго в будущем в бизнес-часовом поясе `Europe/Moscow` (настраивается через `business.time-zone`). При записи сервис проверяет, что автомобиль сейчас доступен и разрешён для тест-драйва. Это проверка в момент бронирования, а не распределённая будущая блокировка автомобиля от последующей продажи или складской операции.
+
+Клиент получает только собственные записи через `GET /api/test-drives/mine` и может отменить свою активную заявку через `POST /api/test-drives/{id}/cancel`; менеджер или администратор может отменить любую активную заявку. Одобрение через `POST /api/test-drives/{id}/approve` разрешено менеджеру или администратору только до начала слота, а завершение через `POST /api/test-drives/{id}/complete` — не раньше его конца. Допустимы переходы `PENDING → APPROVED → COMPLETED` и отмена из `PENDING` или `APPROVED`; повтор уже выполненного перехода идемпотентен, остальные переходы возвращают `409`. Отмена сразу освобождает часовой слот для новой записи.
 
 Основной стек: Java 21, Spring Boot 3.3, Spring Security/OAuth2 Resource Server, Spring Data JPA, PostgreSQL 16, Liquibase, Kafka, gRPC/Protobuf, Keycloak, Gradle 8.12, JUnit 5 и Testcontainers.
 
@@ -89,7 +95,7 @@ Swagger UI доступен по адресам:
 
 При нативном запуске Storage gRPC по умолчанию слушает только `127.0.0.1`. Внутри Compose он слушает контейнерную сеть. Эта сеть и Kafka являются доверенной demo-границей; перед внешним развёртыванием им нужны TLS, аутентификация сервисов и ACL.
 
-Обновление с версии без reservation ledger, reliable messaging или проверки пересечений тест-драйва нужно выполнять с согласованной остановкой и последующим запуском обоих сервисов. Перед добавлением уникального business key проверьте историю склада запросом `SELECT source_order_id, count(*) FROM assembly_orders GROUP BY source_order_id HAVING count(*) > 1;`: миграция намеренно остановится при дублях и не удаляет данные автоматически. `source_order_id` после обновления считается неизменяемым, повторное использование ID после soft delete не поддерживается. Смешанная работа старых и новых версий небезопасна. Миграция reservation помечает прежние неоплаченные заказы как `LEGACY_UNVERIFIED` и проверяет их резерв при попытке оплаты; оплаченные заказы сохраняются как подтверждённые без ретроактивного TTL.
+Обновление с версии без reservation ledger, reliable messaging, demo payment или проверки пересечений тест-драйва нужно выполнять с согласованной остановкой и последующим запуском обоих сервисов. Перед добавлением уникального business key проверьте историю склада запросом `SELECT source_order_id, count(*) FROM assembly_orders GROUP BY source_order_id HAVING count(*) > 1;`: миграция намеренно остановится при дублях и не удаляет данные автоматически. `source_order_id` после обновления считается неизменяемым, повторное использование ID после soft delete не поддерживается. Смешанная работа старых и новых версий небезопасна. В частности, старый `order-service` ещё умеет обходить receipt обычным переходом из `AWAITING_PAYMENT`, поэтому все его узлы нужно остановить до применения миграции `006` и запустить вместе на новой версии. Миграция reservation помечает прежние неоплаченные заказы как `LEGACY_UNVERIFIED` и проверяет их резерв при попытке demo payment; оплаченные заказы сохраняются как подтверждённые без ретроактивного TTL. Старый `CONFIRM_PENDING` без receipt продолжает восстанавливаться worker-ом, но новый payment-запрос для него получает `409` и не создаёт синтетический receipt.
 
 Перед миграцией ограничения test-drive сначала найдите активные строки с невалидным UUID автомобиля:
 
@@ -161,12 +167,29 @@ curl --fail --silent --show-error \
 | Order | `GET /api/v1/cars`, `GET /api/v1/cars/{id}` | `USER`, `MANAGER`, `ADMIN` |
 | Order | `/api/orders/stock/**` | создание и отмена: `USER`/`ADMIN`; просмотр: `USER`/`MANAGER`/`ADMIN`; смена статуса: `MANAGER`/`ADMIN` |
 | Order | `/api/orders/custom/**` | создание и отмена: `USER`/`ADMIN`; просмотр: `USER`/`MANAGER`/`ADMIN`; смена статуса: `MANAGER`/`WAREHOUSE_ADMIN`/`ADMIN` |
-| Order | `/api/test-drives/**` | создание: `USER`/`ADMIN`; просмотр: `MANAGER`/`ADMIN` |
+| Order | `POST /api/orders/{stock\|custom}/{orderId}/demo-payments` | `USER`/`ADMIN`, но JWT subject всегда должен быть владельцем заказа |
+| Order | `GET /api/orders/{stock\|custom}/{orderId}/demo-payments/{paymentId}` | владелец; audit-read: `MANAGER`/`ADMIN` |
+| Order | `/api/test-drives/**` | создание: `USER`/`ADMIN`; свои заявки и их отмена: `USER`; все заявки и смена статуса: `MANAGER`/`ADMIN` |
 | Storage | `GET /api/cars/{id}`, `/api/cars/available`, `/api/cars/test-drive`, `/api/cars/search` | любой аутентифицированный пользователь |
 | Storage | `/api/configuration/**` | любой аутентифицированный пользователь |
 | Storage | `/api/inventory/cars/**` | `MANAGER`, `ADMIN` |
 | Storage | `/api/inventory/parts/**` | чтение: `WAREHOUSE_ADMIN`/`MANAGER`/`ADMIN`; изменение: `WAREHOUSE_ADMIN`/`ADMIN` |
 | Storage | `/api/assembly-orders/**` | `WAREHOUSE_ADMIN`, `ADMIN` |
+
+После перевода заказа в `AWAITING_PAYMENT` demo-попытка выглядит так:
+
+```bash
+IDEMPOTENCY_KEY='90000000-0000-0000-0000-000000000001'
+
+curl --fail-with-body \
+  -X POST "http://localhost:8081/api/orders/stock/${ORDER_ID}/demo-payments" \
+  -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+  -H "Idempotency-Key: ${IDEMPOTENCY_KEY}" \
+  -H 'Content-Type: application/json' \
+  -d '{"outcome":"SUCCESS"}'
+```
+
+Ответ содержит только workflow receipt (`id`, тип и ID заказа, ключ, выбранный исход, статус и безопасный `failureCode`). В нём намеренно нет суммы, платёжных реквизитов или утверждения о реальном списании.
 
 ## Сборка и тесты
 
@@ -179,7 +202,7 @@ curl --fail --silent --show-error \
 
 Задачи `integrationTest` и `e2eTest` требуют работающий Docker для Testcontainers и не включены автоматически в `build`. GitHub Actions выполняет обе вместе со сборкой и unit-тестами на JDK 21.
 
-Интеграционные тесты проверяют конкурентность и гонку confirm/expiry, часовое исключение test-drive и UUID aliases на реальной PostgreSQL, lease/fencing outbox, atomic inbox и обработку poison-сообщения через реальный Kafka DLT. E2E-тест поднимает две PostgreSQL, Kafka и Keycloak, запускает `order-service` и `storage-service` отдельными JVM и проходит настоящий JWT HTTP → gRPC сценарий, включая серверную цену конфигурации и test-drive. Отдельный CI smoke запускает готовый Compose stack и проверяет те же HTTP/gRPC границы, Kafka-переход, повтор ответа, отмену и повторную бронь.
+Интеграционные тесты проверяют конкурентность payment keys, receipt/outbox rollback, recovery после временной ошибки склада, гонку confirm/expiry, lifecycle и часовое исключение test-drive, UUID aliases на реальной PostgreSQL, lease/fencing outbox, atomic inbox и обработку poison-сообщения через реальный Kafka DLT. E2E-тест поднимает две PostgreSQL, Kafka и Keycloak, запускает `order-service` и `storage-service` отдельными JVM и проходит настоящий JWT HTTP → gRPC сценарий, включая серверную цену конфигурации, demo payments и lifecycle test-drive. Отдельный CI smoke запускает готовый Compose stack и проверяет те же HTTP/gRPC границы, Kafka-переход, повтор ответа, отмену и повторную бронь.
 
 ## Ограничения
 

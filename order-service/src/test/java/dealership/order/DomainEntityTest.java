@@ -8,6 +8,7 @@ import dealership.order.core.domain.enums.CustomOrderStatus;
 import dealership.order.core.domain.enums.StockOrderStatus;
 import dealership.order.core.domain.enums.TestDriveStatus;
 import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.TestDriveConflictException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -44,7 +45,9 @@ class DomainEntityTest {
             assertEquals(StockOrderStatus.APPROVED_BY_MANAGER, order.getStatus());
             order.advanceStatus();
             assertEquals(StockOrderStatus.AWAITING_PAYMENT, order.getStatus());
-            order.advanceStatus();
+            assertFalse(order.canAdvance());
+            assertThrows(DomainValidationException.class, order::advanceStatus);
+            order.markPaid();
             assertEquals(StockOrderStatus.PAID, order.getStatus());
             order.advanceStatus();
             assertEquals(StockOrderStatus.READY_FOR_PICKUP, order.getStatus());
@@ -63,7 +66,7 @@ class DomainEntityTest {
             StockOrder o2 = new StockOrder("cl", "m", "c");
             o2.advanceStatus();
             o2.advanceStatus();
-            o2.advanceStatus();
+            o2.markPaid();
             o2.cancel();
             assertEquals(StockOrderStatus.CANCELLED, o2.getStatus());
         }
@@ -72,7 +75,10 @@ class DomainEntityTest {
         @DisplayName("запрет отмены из READY_FOR_PICKUP, COMPLETED, CANCELLED")
         void shouldRejectCancelFromTerminalStates() {
             StockOrder o1 = new StockOrder("cl", "m", "c");
-            for (int i = 0; i < 4; i++) o1.advanceStatus();
+            o1.advanceStatus();
+            o1.advanceStatus();
+            o1.markPaid();
+            o1.advanceStatus();
             assertFalse(o1.canCancel());
             assertThrows(DomainValidationException.class, o1::cancel);
         }
@@ -119,7 +125,9 @@ class DomainEntityTest {
             assertEquals(CustomOrderStatus.APPROVED_BY_WAREHOUSE, order.getStatus());
             order.advanceStatus(null);
             assertEquals(CustomOrderStatus.AWAITING_PAYMENT, order.getStatus());
-            order.advanceStatus(null);
+            assertFalse(order.canAdvance());
+            assertThrows(DomainValidationException.class, () -> order.advanceStatus(null));
+            order.markPaid();
             assertEquals(CustomOrderStatus.PAID, order.getStatus());
             order.advanceStatus(null);
             assertEquals(CustomOrderStatus.AWAITING_DELIVERY, order.getStatus());
@@ -165,6 +173,27 @@ class DomainEntityTest {
             TestDriveRequest req = new TestDriveRequest("client1", "car1", LocalDateTime.now().plusDays(1));
             req.cancel();
             assertEquals(TestDriveStatus.CANCELLED, req.getStatus());
+        }
+
+        @Test
+        @DisplayName("целевой статус идемпотентен, остальные terminal переходы запрещены")
+        void shouldEnforceLifecycleTransitions() {
+            TestDriveRequest cancelled = new TestDriveRequest(
+                    "client1", "car1", LocalDateTime.now().plusDays(1));
+            cancelled.cancel();
+            cancelled.cancel();
+            assertThrows(TestDriveConflictException.class, cancelled::approve);
+            assertThrows(TestDriveConflictException.class, cancelled::complete);
+
+            TestDriveRequest completed = new TestDriveRequest(
+                    "client1", "car1", LocalDateTime.now().plusDays(1));
+            assertThrows(TestDriveConflictException.class, completed::complete);
+            completed.approve();
+            completed.approve();
+            completed.complete();
+            completed.complete();
+            assertThrows(TestDriveConflictException.class, completed::cancel);
+            assertThrows(TestDriveConflictException.class, completed::approve);
         }
 
         @Test

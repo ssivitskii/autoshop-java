@@ -2,6 +2,7 @@ package dealership.order.core.domain.entity.testdrive;
 
 import dealership.order.core.domain.enums.TestDriveStatus;
 import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.TestDriveConflictException;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.Setter;
@@ -47,14 +48,39 @@ public class TestDriveRequest {
     }
 
     public void approve() {
+        if (status == TestDriveStatus.APPROVED) {
+            return;
+        }
+        requireStatus(TestDriveStatus.PENDING, TestDriveStatus.APPROVED);
         this.status = TestDriveStatus.APPROVED;
     }
 
     public void complete() {
+        if (status == TestDriveStatus.COMPLETED) {
+            return;
+        }
+        requireStatus(TestDriveStatus.APPROVED, TestDriveStatus.COMPLETED);
         this.status = TestDriveStatus.COMPLETED;
     }
 
     public void cancel() {
+        if (status == TestDriveStatus.CANCELLED) {
+            return;
+        }
+        if (status != TestDriveStatus.PENDING && status != TestDriveStatus.APPROVED) {
+            throw invalidTransition(TestDriveStatus.CANCELLED);
+        }
         this.status = TestDriveStatus.CANCELLED;
+    }
+
+    private void requireStatus(TestDriveStatus required, TestDriveStatus target) {
+        if (status != required) {
+            throw invalidTransition(target);
+        }
+    }
+
+    private TestDriveConflictException invalidTransition(TestDriveStatus target) {
+        return new TestDriveConflictException(
+                "Нельзя перевести заявку на тест-драйв из %s в %s".formatted(status, target));
     }
 }

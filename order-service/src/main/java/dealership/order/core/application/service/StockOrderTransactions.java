@@ -3,12 +3,18 @@ package dealership.order.core.application.service;
 import dealership.common.event.OrderSentForApprovalEvent;
 import dealership.order.core.application.port.out.StockOrderRepository;
 import dealership.order.core.domain.entity.order.StockOrder;
+import dealership.order.core.domain.enums.DemoPaymentOutcome;
+import dealership.order.core.domain.enums.DemoPaymentStatus;
 import dealership.order.core.domain.enums.StockOrderStatus;
 import dealership.order.core.domain.enums.StockReservationWorkflowState;
+import dealership.order.core.domain.exception.DemoPaymentConflictException;
 import dealership.order.core.domain.exception.DomainValidationException;
 import dealership.order.infrastructure.messaging.OrderEventProducer;
+import dealership.order.infrastructure.persistence.entity.DemoPaymentAttemptJpaEntity;
 import dealership.order.infrastructure.persistence.entity.StockReservationWorkflowJpaEntity;
+import dealership.order.infrastructure.persistence.repository.DemoPaymentAttemptJpaRepository;
 import dealership.order.infrastructure.persistence.repository.StockReservationWorkflowJpaRepository;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,15 +30,20 @@ public class StockOrderTransactions {
 
     public record Work(StockOrder order, Action action) { }
 
+    public record PaymentWork(DemoPaymentAttemptJpaEntity payment, Work work) { }
+
     private final StockOrderRepository orderRepository;
     private final StockReservationWorkflowJpaRepository workflowRepository;
+    private final DemoPaymentAttemptJpaRepository paymentRepository;
     private final OrderEventProducer eventProducer;
 
     public StockOrderTransactions(StockOrderRepository orderRepository,
                                   StockReservationWorkflowJpaRepository workflowRepository,
+                                  DemoPaymentAttemptJpaRepository paymentRepository,
                                   OrderEventProducer eventProducer) {
         this.orderRepository = orderRepository;
         this.workflowRepository = workflowRepository;
+        this.paymentRepository = paymentRepository;
         this.eventProducer = eventProducer;
     }
 
@@ -73,24 +84,61 @@ public class StockOrderTransactions {
         StockOrder order = orderRepository.findByIdForUpdate(orderId);
         StockReservationWorkflowJpaEntity workflow = lockWorkflow(orderId);
         if (order.getStatus() == StockOrderStatus.AWAITING_PAYMENT) {
-            if (workflow.getState() == StockReservationWorkflowState.HELD
-                    || workflow.getState() == StockReservationWorkflowState.LEGACY_UNVERIFIED) {
-                workflow.setState(StockReservationWorkflowState.CONFIRM_PENDING);
-                workflow.setNextAttemptAt(workflowRepository.databaseNow());
-                workflowRepository.save(workflow);
-                return new Work(order, Action.CONFIRM);
-            }
-            if (workflow.getState() == StockReservationWorkflowState.CONFIRM_PENDING) {
-                return new Work(order, Action.CONFIRM);
-            }
-            if (workflow.getState() == StockReservationWorkflowState.CONFIRMED) {
-                return new Work(finalizePaid(order), Action.NONE);
-            }
-            throw new DomainValidationException("Резерв автомобиля уже завершён");
+            throw new DemoPaymentConflictException(
+                    "Заказ, ожидающий оплату, продвигается только через demo payment");
         }
 
         order.advanceStatus();
         return new Work(orderRepository.save(order), Action.NONE);
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public PaymentWork startDemoPayment(String orderId, String clientId,
+                                        UUID idempotencyKey, DemoPaymentOutcome outcome) {
+        StockOrder order = orderRepository.findByIdForUpdate(orderId);
+        if (!order.getClientId().equals(clientId)) {
+            throw new AccessDeniedException("Заказ принадлежит другому клиенту");
+        }
+        StockReservationWorkflowJpaEntity workflow = lockWorkflow(orderId);
+        UUID orderUuid = UUID.fromString(orderId);
+
+        var replay = paymentRepository.findStockByKeyForUpdate(orderUuid, idempotencyKey);
+        if (replay.isPresent()) {
+            DemoPaymentAttemptJpaEntity payment = replay.get();
+            requireSameOutcome(payment, outcome);
+            return new PaymentWork(payment, new Work(order, Action.NONE));
+        }
+
+        if (paymentRepository.findFirstByStockOrderIdAndStatusIn(
+                orderUuid, List.of(DemoPaymentStatus.PENDING, DemoPaymentStatus.SUCCEEDED)).isPresent()) {
+            throw new DemoPaymentConflictException(
+                    "Для заказа уже существует активная или успешная demo payment попытка");
+        }
+        if (order.getStatus() != StockOrderStatus.AWAITING_PAYMENT) {
+            throw new DemoPaymentConflictException("Заказ не ожидает demo payment");
+        }
+        if (workflow.getState() == StockReservationWorkflowState.CONFIRM_PENDING) {
+            throw new DemoPaymentConflictException(
+                    "Для заказа уже выполняется подтверждение резерва без demo payment receipt");
+        }
+
+        DemoPaymentAttemptJpaEntity payment = newStockPayment(
+                orderUuid, clientId, idempotencyKey, outcome);
+        if (outcome == DemoPaymentOutcome.DECLINE) {
+            payment.setStatus(DemoPaymentStatus.DECLINED);
+            return new PaymentWork(paymentRepository.saveAndFlush(payment),
+                    new Work(order, Action.NONE));
+        }
+        if (workflow.getState() != StockReservationWorkflowState.HELD
+                && workflow.getState() != StockReservationWorkflowState.LEGACY_UNVERIFIED) {
+            throw new DemoPaymentConflictException("Резерв автомобиля уже завершён");
+        }
+        workflow.setState(StockReservationWorkflowState.CONFIRM_PENDING);
+        workflow.setNextAttemptAt(workflowRepository.databaseNow());
+        workflowRepository.save(workflow);
+        payment.setStatus(DemoPaymentStatus.PENDING);
+        return new PaymentWork(paymentRepository.saveAndFlush(payment),
+                new Work(order, Action.CONFIRM));
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
@@ -104,9 +152,15 @@ public class StockOrderTransactions {
         workflow.setState(StockReservationWorkflowState.CONFIRMED);
         workflow.setNextAttemptAt(null);
         workflowRepository.save(workflow);
+        var payment = paymentRepository.findPendingStockForUpdate(
+                UUID.fromString(orderId), DemoPaymentStatus.PENDING);
         if (order.getStatus() == StockOrderStatus.AWAITING_PAYMENT) {
-            return finalizePaid(order);
+            order = finalizePaid(order);
         }
+        payment.ifPresent(attempt -> {
+            attempt.setStatus(DemoPaymentStatus.SUCCEEDED);
+            paymentRepository.save(attempt);
+        });
         return order;
     }
 
@@ -124,6 +178,13 @@ public class StockOrderTransactions {
         workflow.setState(StockReservationWorkflowState.EXPIRED);
         workflow.setNextAttemptAt(null);
         workflowRepository.save(workflow);
+        paymentRepository.findPendingStockForUpdate(
+                        UUID.fromString(orderId), DemoPaymentStatus.PENDING)
+                .ifPresent(attempt -> {
+                    attempt.setStatus(DemoPaymentStatus.FAILED);
+                    attempt.setFailureCode("RESERVATION_UNAVAILABLE");
+                    paymentRepository.save(attempt);
+                });
         return order;
     }
 
@@ -192,7 +253,7 @@ public class StockOrderTransactions {
     }
 
     private StockOrder finalizePaid(StockOrder order) {
-        order.advanceStatus();
+        order.markPaid();
         StockOrder saved = orderRepository.save(order);
         OrderSentForApprovalEvent event = new OrderSentForApprovalEvent();
         event.setOrderId(saved.getId());
@@ -201,6 +262,24 @@ public class StockOrderTransactions {
         event.setCarId(saved.getCarId());
         eventProducer.publishOrderPaid(event);
         return saved;
+    }
+
+    private DemoPaymentAttemptJpaEntity newStockPayment(
+            UUID orderId, String clientId, UUID idempotencyKey, DemoPaymentOutcome outcome) {
+        DemoPaymentAttemptJpaEntity payment = new DemoPaymentAttemptJpaEntity();
+        payment.setStockOrderId(orderId);
+        payment.setClientId(clientId);
+        payment.setIdempotencyKey(idempotencyKey);
+        payment.setRequestedOutcome(outcome);
+        return payment;
+    }
+
+    private void requireSameOutcome(DemoPaymentAttemptJpaEntity payment,
+                                    DemoPaymentOutcome outcome) {
+        if (payment.getRequestedOutcome() != outcome) {
+            throw new DemoPaymentConflictException(
+                    "Idempotency-Key уже использован с другим demo outcome");
+        }
     }
 
     private StockReservationWorkflowJpaEntity lockWorkflow(String orderId) {

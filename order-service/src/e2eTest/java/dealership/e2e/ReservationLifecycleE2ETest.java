@@ -103,7 +103,7 @@ class ReservationLifecycleE2ETest {
         String clientTwo = token("client2");
         String manager = token("manager1");
 
-        verifyRealQuoteAndTestDrive(clientOne);
+        verifyRealQuoteAndTestDrive(clientOne, clientTwo, manager);
 
         JsonNode first = createOrder(clientOne, CAR_ONE, 201);
         createOrder(clientTwo, CAR_ONE, 409);
@@ -146,9 +146,26 @@ class ReservationLifecycleE2ETest {
 
         JsonNode paid = createOrder(clientOne, CAR_ONE, 201);
         String paidId = paid.get("id").asText();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 2; i++) {
             request("POST", "/api/orders/stock/" + paidId + "/advance", manager, null, 200);
         }
+        String paymentKey = java.util.UUID.randomUUID().toString();
+        String paymentPath = "/api/orders/stock/" + paidId + "/demo-payments";
+        String paymentBody = "{\"outcome\":\"SUCCESS\"}";
+        JsonNode receipt = json.readTree(request(
+                "POST", paymentPath, clientOne, paymentBody, 200,
+                Map.of("Idempotency-Key", paymentKey)).body());
+        assertEquals("SUCCEEDED", receipt.get("status").asText());
+        JsonNode replay = json.readTree(request(
+                "POST", paymentPath, clientOne, paymentBody, 200,
+                Map.of("Idempotency-Key", paymentKey)).body());
+        assertEquals(receipt.get("id").asText(), replay.get("id").asText());
+        request("POST", paymentPath, clientOne, "{\"outcome\":\"DECLINE\"}", 409,
+                Map.of("Idempotency-Key", paymentKey));
+        request("GET", paymentPath + "/" + receipt.get("id").asText(),
+                clientTwo, null, 403);
+        request("GET", paymentPath + "/" + receipt.get("id").asText(),
+                manager, null, 200);
         assertEquals("PAID", orderValue("SELECT status FROM stock_orders WHERE id = ?::uuid", paidId));
         assertEquals("1", orderValue(
                 "SELECT count(*)::text FROM outbox_events WHERE aggregate_id = ? AND event_type = 'OrderSentForApproval'",
@@ -165,7 +182,8 @@ class ReservationLifecycleE2ETest {
         assertEquals("false", storageValue("SELECT available::text FROM cars WHERE id = ?::uuid", CAR_ONE));
     }
 
-    private void verifyRealQuoteAndTestDrive(String token) throws Exception {
+    private void verifyRealQuoteAndTestDrive(
+            String clientOne, String clientTwo, String manager) throws Exception {
         String modelId = "b0000000-0000-0000-0000-000000000001";
         Map<String, String> variants = Map.of(
                 "c0000000-0000-0000-0000-000000000001", "d0000000-0000-0000-0000-000000000001",
@@ -177,19 +195,51 @@ class ReservationLifecycleE2ETest {
                 "selectedVariants", variants,
                 "totalPrice", "0.01"));
         JsonNode customOrder = json.readTree(request(
-                "POST", "/api/orders/custom", token, customBody, 201).body());
+                "POST", "/api/orders/custom", clientOne, customBody, 201).body());
         assertEquals("3500000.00", customOrder.get("totalPrice").decimalValue().setScale(2).toPlainString());
-        request("POST", "/api/orders/custom", token, json.writeValueAsString(Map.of(
+        request("POST", "/api/orders/custom", clientOne, json.writeValueAsString(Map.of(
                 "carModelId", modelId, "selectedVariants", Map.of(), "totalPrice", "999999999")), 400);
+        String customId = customOrder.get("id").asText();
+        request("POST", "/api/orders/custom/" + customId + "/advance", manager, null, 200);
+        request("POST", "/api/orders/custom/" + customId + "/advance", manager, null, 200);
+        String customPaymentPath = "/api/orders/custom/" + customId + "/demo-payments";
+        JsonNode customReceipt = json.readTree(request(
+                "POST", customPaymentPath, clientOne, "{\"outcome\":\"SUCCESS\"}", 200,
+                Map.of("Idempotency-Key", java.util.UUID.randomUUID().toString())).body());
+        assertEquals("SUCCEEDED", customReceipt.get("status").asText());
+        request("GET", customPaymentPath + "/" + customReceipt.get("id").asText(),
+                manager, null, 200);
 
         LocalDateTime start = LocalDateTime.now().plusDays(2).truncatedTo(ChronoUnit.SECONDS);
-        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
-                "carId", CAR_ONE, "scheduledAt", start.toString())), 201);
-        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
+        String firstBody = json.writeValueAsString(Map.of(
+                "carId", CAR_ONE, "scheduledAt", start.toString()));
+        JsonNode first = json.readTree(request(
+                "POST", "/api/test-drives", clientOne, firstBody, 201).body());
+        String firstId = first.get("id").asText();
+        JsonNode mine = json.readTree(request(
+                "GET", "/api/test-drives/mine", clientOne, null, 200).body());
+        assertTrue(mine.findValuesAsText("id").contains(firstId));
+        request("POST", "/api/test-drives/" + firstId + "/cancel", clientTwo, null, 403);
+        request("POST", "/api/test-drives/" + firstId + "/approve", manager, null, 200);
+        request("POST", "/api/test-drives/" + firstId + "/complete", manager, null, 409);
+        request("POST", "/api/test-drives/" + firstId + "/cancel", clientOne, null, 200);
+        request("POST", "/api/test-drives/" + firstId + "/cancel", clientOne, null, 200);
+
+        JsonNode replacement = json.readTree(request(
+                "POST", "/api/test-drives", clientTwo, firstBody, 201).body());
+        request("POST", "/api/test-drives", clientOne, json.writeValueAsString(Map.of(
                 "carId", CAR_ONE, "scheduledAt", start.plusMinutes(30).toString())), 409);
-        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
-                "carId", CAR_ONE, "scheduledAt", start.plusHours(1).toString())), 201);
-        request("POST", "/api/test-drives", token, json.writeValueAsString(Map.of(
+        request("POST", "/api/test-drives/" + replacement.get("id").asText() + "/cancel",
+                manager, null, 200);
+        JsonNode completable = json.readTree(request(
+                "POST", "/api/test-drives", clientOne, json.writeValueAsString(Map.of(
+                        "carId", CAR_ONE, "scheduledAt", start.plusHours(1).toString())), 201).body());
+        String completableId = completable.get("id").asText();
+        request("POST", "/api/test-drives/" + completableId + "/approve", manager, null, 200);
+        orderUpdate("UPDATE test_drive_requests SET requested_date_time = clock_timestamp() - INTERVAL '2 hours' WHERE id = ?::uuid",
+                completableId);
+        request("POST", "/api/test-drives/" + completableId + "/complete", manager, null, 200);
+        request("POST", "/api/test-drives", clientOne, json.writeValueAsString(Map.of(
                 "carId", CAR_TWO, "scheduledAt", start.plusDays(1).toString())), 409);
     }
 
@@ -200,9 +250,15 @@ class ReservationLifecycleE2ETest {
     }
 
     private Response request(String method, String path, String token, String body, int expected) throws Exception {
+        return request(method, path, token, body, expected, Map.of());
+    }
+
+    private Response request(String method, String path, String token, String body, int expected,
+                             Map<String, String> headers) throws Exception {
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + orderPort + path))
                 .timeout(Duration.ofSeconds(15))
                 .header("Authorization", "Bearer " + token);
+        headers.forEach(builder::header);
         if (body == null) {
             builder.method(method, HttpRequest.BodyPublishers.noBody());
         } else {

@@ -3,6 +3,7 @@ package dealership.order.core.domain.entity.order;
 import dealership.order.core.domain.entity.car.CarConfiguration;
 import dealership.order.core.domain.entity.order.state.custom.CreatedCustomOrderState;
 import dealership.order.core.domain.entity.order.state.custom.CustomOrderState;
+import dealership.order.core.domain.entity.order.state.custom.PaidCustomOrderState;
 import dealership.order.core.domain.enums.CustomOrderStatus;
 import dealership.order.core.domain.exception.DomainValidationException;
 import lombok.EqualsAndHashCode;
@@ -69,6 +70,13 @@ public class CustomOrder {
 
     public void advanceStatus(CustomOrderStatus status) {
         state.advance(this);
+    }
+
+    public void markPaid() {
+        if (getStatus() != CustomOrderStatus.AWAITING_PAYMENT) {
+            throw new DomainValidationException("Оплату можно зафиксировать только для заказа, ожидающего оплату");
+        }
+        setState(new PaidCustomOrderState());
     }
 
     public void cancel() {

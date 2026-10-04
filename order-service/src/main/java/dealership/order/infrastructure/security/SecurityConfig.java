@@ -34,6 +34,13 @@ public class SecurityConfig {
                                 "/actuator/health"
                         ).permitAll()
 
+                        .requestMatchers(HttpMethod.POST,
+                                "/api/orders/stock/*/demo-payments",
+                                "/api/orders/custom/*/demo-payments").hasAnyRole("USER", "ADMIN")
+                        .requestMatchers(HttpMethod.GET,
+                                "/api/orders/stock/*/demo-payments/*",
+                                "/api/orders/custom/*/demo-payments/*").hasAnyRole("USER", "MANAGER", "ADMIN")
+
                         .requestMatchers(HttpMethod.POST, "/api/orders/stock").hasAnyRole("USER", "ADMIN")
                         .requestMatchers(HttpMethod.GET, "/api/orders/stock/**").hasAnyRole("USER", "MANAGER", "ADMIN")
                         .requestMatchers("/api/orders/stock/**").hasAnyRole("USER", "MANAGER", "ADMIN")
@@ -44,6 +51,8 @@ public class SecurityConfig {
 
                         .requestMatchers(HttpMethod.POST, "/api/test-drives").hasAnyRole("USER", "ADMIN")
                         .requestMatchers(HttpMethod.GET, "/api/test-drives/**").hasAnyRole("USER", "MANAGER", "ADMIN")
+                        .requestMatchers(HttpMethod.POST, "/api/test-drives/*/approve", "/api/test-drives/*/complete").hasAnyRole("MANAGER", "ADMIN")
+                        .requestMatchers(HttpMethod.POST, "/api/test-drives/*/cancel").hasAnyRole("USER", "MANAGER", "ADMIN")
 
                         .requestMatchers("/api/v1/cars/**").hasAnyRole("USER", "MANAGER", "ADMIN")
                         .anyRequest().authenticated()

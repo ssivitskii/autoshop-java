@@ -35,6 +35,21 @@ status_code() {
     -H "Authorization: Bearer ${bearer}" -H 'Content-Type: application/json' -d "$body"
 }
 
+request_with_key() {
+  local method="$1" path="$2" bearer="$3" key="$4" body="${5:-}"
+  curl --fail --silent --show-error -X "$method" "${ORDER_URL}${path}" \
+    -H "Authorization: Bearer ${bearer}" -H "Idempotency-Key: ${key}" \
+    -H 'Content-Type: application/json' -d "$body"
+}
+
+status_code_with_key() {
+  local method="$1" path="$2" bearer="$3" key="$4" body="$5"
+  curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    -X "$method" "${ORDER_URL}${path}" \
+    -H "Authorization: Bearer ${bearer}" -H "Idempotency-Key: ${key}" \
+    -H 'Content-Type: application/json' -d "$body"
+}
+
 await_status() {
   local order_id="$1" bearer="$2" expected="$3"
   local deadline=$((SECONDS + 60)) status
@@ -74,6 +89,13 @@ jq -e '.totalPrice == 3500000' <<<"$custom_order" >/dev/null
 invalid_custom="$(jq -nc --arg model "$MODEL_320" \
   '{carModelId:$model,selectedVariants:{},totalPrice:999999999}')"
 test "$(status_code POST '/api/orders/custom' "$client_one" "$invalid_custom")" = 400
+custom_id="$(jq -er '.id' <<<"$custom_order")"
+request POST "/api/orders/custom/${custom_id}/advance" "$manager" >/dev/null
+request POST "/api/orders/custom/${custom_id}/advance" "$manager" >/dev/null
+custom_payment_path="/api/orders/custom/${custom_id}/demo-payments"
+custom_payment="$(request_with_key POST "$custom_payment_path" "$client_one" \
+  '90000000-0000-0000-0000-000000000002' '{"outcome":"SUCCESS"}')"
+test "$(jq -er '.status' <<<"$custom_payment")" = SUCCEEDED
 
 test_drive_start_epoch="$(jq -nr '((now / 3600 | floor) * 3600 + 172800)')"
 test_drive_start="$(jq -nr --argjson value "$test_drive_start_epoch" \
@@ -86,22 +108,47 @@ test_drive_unavailable="$(jq -nr --argjson value "$((test_drive_start_epoch + 86
   '$value | strftime("%Y-%m-%dT%H:%M:%S")')"
 drive_body="$(jq -nc --arg car "$CAR_ONE" --arg time "$test_drive_start" \
   '{carId:$car,scheduledAt:$time}')"
-request POST '/api/test-drives' "$client_one" "$drive_body" >/dev/null
+drive="$(request POST '/api/test-drives' "$client_one" "$drive_body")"
+drive_id="$(jq -er '.id' <<<"$drive")"
+request GET '/api/test-drives/mine' "$client_one" | \
+  jq -e --arg id "$drive_id" 'any(.[]; .id == $id)' >/dev/null
+test "$(status_code POST "/api/test-drives/${drive_id}/cancel" "$client_two" '')" = 403
+request POST "/api/test-drives/${drive_id}/approve" "$manager" >/dev/null
+test "$(status_code POST "/api/test-drives/${drive_id}/complete" "$manager" '')" = 409
+request POST "/api/test-drives/${drive_id}/cancel" "$client_one" >/dev/null
+replacement="$(request POST '/api/test-drives' "$client_two" "$drive_body")"
+replacement_id="$(jq -er '.id' <<<"$replacement")"
 overlap_body="$(jq -nc --arg car "$CAR_ONE" --arg time "$test_drive_overlap" \
   '{carId:$car,scheduledAt:$time}')"
 test "$(status_code POST '/api/test-drives' "$client_two" "$overlap_body")" = 409
+request POST "/api/test-drives/${replacement_id}/cancel" "$manager" >/dev/null
 adjacent_body="$(jq -nc --arg car "$CAR_ONE" --arg time "$test_drive_adjacent" \
   '{carId:$car,scheduledAt:$time}')"
-request POST '/api/test-drives' "$client_two" "$adjacent_body" >/dev/null
+adjacent="$(request POST '/api/test-drives' "$client_two" "$adjacent_body")"
+adjacent_id="$(jq -er '.id' <<<"$adjacent")"
+request POST "/api/test-drives/${adjacent_id}/approve" "$manager" >/dev/null
+docker compose exec -T order-db psql -U orders -d order_service -v ON_ERROR_STOP=1 \
+  -c "UPDATE test_drive_requests SET requested_date_time = clock_timestamp() - INTERVAL '2 hours' WHERE id = '${adjacent_id}'::uuid" >/dev/null
+request POST "/api/test-drives/${adjacent_id}/complete" "$manager" >/dev/null
 unavailable_body="$(jq -nc --arg car "$CAR_TWO" --arg time "$test_drive_unavailable" \
   '{carId:$car,scheduledAt:$time}')"
 test "$(status_code POST '/api/test-drives' "$client_one" "$unavailable_body")" = 409
 
 paid_order="$(request POST '/api/orders/stock' "$client_one" "{\"carId\":\"${CAR_ONE}\"}")"
 paid_id="$(jq -er '.id' <<<"$paid_order")"
-for _ in 1 2 3; do
+for _ in 1 2; do
   request POST "/api/orders/stock/${paid_id}/advance" "$manager" >/dev/null
 done
+payment_key="90000000-0000-0000-0000-000000000001"
+payment_path="/api/orders/stock/${paid_id}/demo-payments"
+payment_body='{"outcome":"SUCCESS"}'
+payment_receipt="$(request_with_key POST "$payment_path" "$client_one" "$payment_key" "$payment_body")"
+test "$(jq -er '.status' <<<"$payment_receipt")" = SUCCEEDED
+payment_id="$(jq -er '.id' <<<"$payment_receipt")"
+payment_replay="$(request_with_key POST "$payment_path" "$client_one" "$payment_key" "$payment_body")"
+test "$(jq -er '.id' <<<"$payment_replay")" = "$payment_id"
+test "$(status_code_with_key POST "$payment_path" "$client_one" "$payment_key" '{"outcome":"DECLINE"}')" = 409
+test "$(request GET "${payment_path}/${payment_id}" "$manager" | jq -er '.status')" = SUCCEEDED
 await_status "$paid_id" "$client_one" READY_FOR_PICKUP
 
 response_envelope="$(docker compose exec -T storage-db psql -U storage -d storage_service -At \
@@ -131,4 +178,4 @@ request POST "/api/orders/stock/${cancelled_id}/cancel" "$client_one" >/dev/null
 rebooked="$(request POST '/api/orders/stock' "$client_two" "{\"carId\":\"${CAR_TWO}\"}")"
 test "$(jq -er '.status' <<<"$rebooked")" = CREATED
 
-echo "Compose smoke passed: Kafka approval is idempotent and cancelled stock can be rebooked."
+echo "Compose smoke passed: lifecycle, demo payment, Kafka approval and rebooking are consistent."
