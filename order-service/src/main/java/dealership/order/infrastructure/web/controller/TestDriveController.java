@@ -15,6 +15,7 @@ import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.UUID;
 
 @RestController
 @RequestMapping("/api/test-drives")
@@ -65,25 +66,25 @@ public class TestDriveController {
     @PostMapping("/{id}/cancel")
     @PreAuthorize("hasAnyRole('USER', 'MANAGER', 'ADMIN')")
     @Operation(summary = "Отменить заявку (владелец, MANAGER или ADMIN)")
-    public ResponseEntity<TestDriveResponse> cancel(@PathVariable String id,
+    public ResponseEntity<TestDriveResponse> cancel(@PathVariable UUID id,
                                                      @AuthenticationPrincipal Jwt jwt,
                                                      Authentication authentication) {
         return ResponseEntity.ok(mapper.toResponse(testDriveService.cancelRequest(
-                id, jwt.getSubject(), isStaff(authentication))));
+                id.toString(), jwt.getSubject(), isStaff(authentication))));
     }
 
     @PostMapping("/{id}/approve")
     @PreAuthorize("hasAnyRole('MANAGER', 'ADMIN')")
     @Operation(summary = "Одобрить заявку (MANAGER/ADMIN)")
-    public ResponseEntity<TestDriveResponse> approve(@PathVariable String id) {
-        return ResponseEntity.ok(mapper.toResponse(testDriveService.approveRequest(id)));
+    public ResponseEntity<TestDriveResponse> approve(@PathVariable UUID id) {
+        return ResponseEntity.ok(mapper.toResponse(testDriveService.approveRequest(id.toString())));
     }
 
     @PostMapping("/{id}/complete")
     @PreAuthorize("hasAnyRole('MANAGER', 'ADMIN')")
     @Operation(summary = "Завершить тест-драйв (MANAGER/ADMIN)")
-    public ResponseEntity<TestDriveResponse> complete(@PathVariable String id) {
-        return ResponseEntity.ok(mapper.toResponse(testDriveService.completeRequest(id)));
+    public ResponseEntity<TestDriveResponse> complete(@PathVariable UUID id) {
+        return ResponseEntity.ok(mapper.toResponse(testDriveService.completeRequest(id.toString())));
     }
 
     private boolean isStaff(Authentication authentication) {

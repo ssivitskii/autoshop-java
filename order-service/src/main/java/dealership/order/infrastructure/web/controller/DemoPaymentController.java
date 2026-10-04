@@ -40,13 +40,13 @@ public class DemoPaymentController {
     @PreAuthorize("hasAnyRole('USER', 'ADMIN')")
     @Operation(summary = "Simulate a stock-order payment outcome (demo only)")
     public ResponseEntity<DemoPaymentReceiptResponse> startStock(
-            @PathVariable String orderId,
+            @PathVariable UUID orderId,
             @Parameter(required = true, description = "UUID scoped to this order")
             @RequestHeader("Idempotency-Key") UUID idempotencyKey,
             @RequestBody CreateDemoPaymentRequest request,
             @AuthenticationPrincipal Jwt jwt) {
         return receipt(paymentService.startStockPayment(
-                orderId, jwt.getSubject(), idempotencyKey,
+                orderId.toString(), jwt.getSubject(), idempotencyKey,
                 request == null ? null : request.getOutcome()));
     }
 
@@ -54,13 +54,13 @@ public class DemoPaymentController {
     @PreAuthorize("hasAnyRole('USER', 'ADMIN')")
     @Operation(summary = "Simulate a custom-order payment outcome (demo only)")
     public ResponseEntity<DemoPaymentReceiptResponse> startCustom(
-            @PathVariable String orderId,
+            @PathVariable UUID orderId,
             @Parameter(required = true, description = "UUID scoped to this order")
             @RequestHeader("Idempotency-Key") UUID idempotencyKey,
             @RequestBody CreateDemoPaymentRequest request,
             @AuthenticationPrincipal Jwt jwt) {
         return receipt(paymentService.startCustomPayment(
-                orderId, jwt.getSubject(), idempotencyKey,
+                orderId.toString(), jwt.getSubject(), idempotencyKey,
                 request == null ? null : request.getOutcome()));
     }
 
@@ -68,20 +68,22 @@ public class DemoPaymentController {
     @PreAuthorize("hasAnyRole('USER', 'MANAGER', 'ADMIN')")
     @Operation(summary = "Read a stock-order demo payment receipt")
     public ResponseEntity<DemoPaymentReceiptResponse> getStock(
-            @PathVariable String orderId, @PathVariable String paymentId,
+            @PathVariable UUID orderId, @PathVariable UUID paymentId,
             @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
         return receipt(paymentService.getStockPayment(
-                orderId, paymentId, jwt.getSubject(), canAudit(authentication)));
+                orderId.toString(), paymentId.toString(), jwt.getSubject(),
+                canAudit(authentication)));
     }
 
     @GetMapping("/custom/{orderId}/demo-payments/{paymentId}")
     @PreAuthorize("hasAnyRole('USER', 'MANAGER', 'ADMIN')")
     @Operation(summary = "Read a custom-order demo payment receipt")
     public ResponseEntity<DemoPaymentReceiptResponse> getCustom(
-            @PathVariable String orderId, @PathVariable String paymentId,
+            @PathVariable UUID orderId, @PathVariable UUID paymentId,
             @AuthenticationPrincipal Jwt jwt, Authentication authentication) {
         return receipt(paymentService.getCustomPayment(
-                orderId, paymentId, jwt.getSubject(), canAudit(authentication)));
+                orderId.toString(), paymentId.toString(), jwt.getSubject(),
+                canAudit(authentication)));
     }
 
     private ResponseEntity<DemoPaymentReceiptResponse> receipt(
