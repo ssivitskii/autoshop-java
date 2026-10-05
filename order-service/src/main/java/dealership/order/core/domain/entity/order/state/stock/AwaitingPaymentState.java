@@ -2,11 +2,12 @@ package dealership.order.core.domain.entity.order.state.stock;
 
 import dealership.order.core.domain.entity.order.StockOrder;
 import dealership.order.core.domain.enums.StockOrderStatus;
+import dealership.order.core.domain.exception.DomainValidationException;
 
 public class AwaitingPaymentState implements OrderState {
     @Override
     public void advance(StockOrder order) {
-        order.setState(new PaidState());
+        throw new DomainValidationException("Статус оплаты изменяется только через demo payment");
     }
 
     @Override
@@ -21,7 +22,7 @@ public class AwaitingPaymentState implements OrderState {
 
     @Override
     public boolean canAdvance() {
-        return true;
+        return false;
     }
 
     @Override

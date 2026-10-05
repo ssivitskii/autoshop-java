@@ -9,3 +9,5 @@ databaseChangeLog:
       file: db/changelog/004-reliable-messaging.sql
   - include:
       file: db/changelog/005-prevent-test-drive-overlap.sql
+  - include:
+      file: db/changelog/006-create-demo-payment-attempts.sql

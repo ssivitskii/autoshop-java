@@ -47,6 +47,13 @@ public class TestDriveRequestRepositoryAdapter implements TestDriveRequestReposi
     }
 
     @Override
+    public TestDriveRequest findByIdForUpdate(String id) {
+        return jpaRepository.findByIdForUpdate(UUID.fromString(id)).map(mapper::toDomain)
+                .orElseThrow(() -> new EntityNotFoundException(
+                        "Заявка на тест-драйв с id '%s' не найдена".formatted(id)));
+    }
+
+    @Override
     public List<TestDriveRequest> findAll() {
         return jpaRepository.findByRemovedFalse().stream().map(mapper::toDomain).toList();
     }
@@ -54,6 +61,13 @@ public class TestDriveRequestRepositoryAdapter implements TestDriveRequestReposi
     @Override
     public List<TestDriveRequest> findByCarId(String carId) {
         return jpaRepository.findByCarIdAndRemovedFalse(carId).stream().map(mapper::toDomain).toList();
+    }
+
+    @Override
+    public List<TestDriveRequest> findByClientId(String clientId) {
+        return jpaRepository.findByClientIdAndRemovedFalse(clientId).stream()
+                .map(mapper::toDomain)
+                .toList();
     }
 
     @Override

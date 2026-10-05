@@ -9,9 +9,13 @@ public interface TestDriveRequestRepository {
 
     TestDriveRequest findById(String id);
 
+    TestDriveRequest findByIdForUpdate(String id);
+
     List<TestDriveRequest> findAll();
 
     List<TestDriveRequest> findByCarId(String carId);
+
+    List<TestDriveRequest> findByClientId(String clientId);
 
     void deleteById(String id);
 }

@@ -2,11 +2,12 @@ package dealership.order.core.domain.entity.order.state.custom;
 
 import dealership.order.core.domain.entity.order.CustomOrder;
 import dealership.order.core.domain.enums.CustomOrderStatus;
+import dealership.order.core.domain.exception.DomainValidationException;
 
 public class AwaitingPaymentCustomOrderState implements CustomOrderState {
     @Override
     public void advance(CustomOrder order) {
-        order.setState(new PaidCustomOrderState());
+        throw new DomainValidationException("Статус оплаты изменяется только через demo payment");
     }
 
     @Override
@@ -21,7 +22,7 @@ public class AwaitingPaymentCustomOrderState implements CustomOrderState {
 
     @Override
     public boolean canAdvance() {
-        return true;
+        return false;
     }
 
     @Override

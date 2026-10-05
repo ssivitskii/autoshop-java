@@ -1,6 +1,7 @@
 package dealership.order.infrastructure.web.exception;
 
 import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.DemoPaymentConflictException;
 import dealership.order.core.domain.exception.EntityNotFoundException;
 import dealership.order.core.domain.exception.IncompatibleComponentException;
 import dealership.order.core.domain.exception.CarReservationConflictException;
@@ -13,6 +14,8 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.bind.MissingRequestHeaderException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -77,12 +80,34 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.CONFLICT).body(error);
     }
 
+    @ExceptionHandler(DemoPaymentConflictException.class)
+    public ResponseEntity<ErrorResponse> handleDemoPaymentConflict(DemoPaymentConflictException ex) {
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.CONFLICT.value(),
+                "Demo Payment Conflict",
+                ex.getMessage(),
+                Instant.now()
+        );
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(error);
+    }
+
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ErrorResponse> handleUnreadableMessage(HttpMessageNotReadableException ex) {
         ErrorResponse error = new ErrorResponse(
                 HttpStatus.BAD_REQUEST.value(),
                 "Bad Request",
                 "Некорректное тело запроса",
+                Instant.now()
+        );
+        return ResponseEntity.badRequest().body(error);
+    }
+
+    @ExceptionHandler({MissingRequestHeaderException.class, MethodArgumentTypeMismatchException.class})
+    public ResponseEntity<ErrorResponse> handleRequestArgument(Exception ex) {
+        ErrorResponse error = new ErrorResponse(
+                HttpStatus.BAD_REQUEST.value(),
+                "Bad Request",
+                "Некорректный или отсутствующий параметр запроса",
                 Instant.now()
         );
         return ResponseEntity.badRequest().body(error);

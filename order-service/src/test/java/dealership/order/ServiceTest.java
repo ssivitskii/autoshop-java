@@ -18,14 +18,20 @@ import dealership.order.core.domain.entity.order.StockOrder;
 import dealership.order.core.domain.entity.testdrive.TestDriveRequest;
 import dealership.order.core.domain.entity.user.User;
 import dealership.order.core.domain.enums.CustomOrderStatus;
+import dealership.order.core.domain.enums.DemoPaymentOutcome;
+import dealership.order.core.domain.enums.DemoPaymentStatus;
 import dealership.order.core.domain.enums.StockOrderStatus;
 import dealership.order.core.domain.enums.StockReservationWorkflowState;
 import dealership.order.core.domain.enums.TestDriveStatus;
 import dealership.order.core.domain.enums.UserRole;
 import dealership.order.core.domain.exception.DomainValidationException;
+import dealership.order.core.domain.exception.DemoPaymentConflictException;
 import dealership.order.core.domain.exception.StorageUnavailableException;
+import dealership.order.core.domain.exception.TestDriveConflictException;
 import dealership.order.infrastructure.messaging.OrderEventProducer;
 import dealership.order.infrastructure.persistence.entity.StockReservationWorkflowJpaEntity;
+import dealership.order.infrastructure.persistence.entity.DemoPaymentAttemptJpaEntity;
+import dealership.order.infrastructure.persistence.repository.DemoPaymentAttemptJpaRepository;
 import dealership.order.infrastructure.persistence.repository.StockReservationWorkflowJpaRepository;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -36,6 +42,7 @@ import org.mockito.InjectMocks;
 import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.security.access.AccessDeniedException;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
@@ -129,7 +136,6 @@ class ServiceTest {
             StockOrder order = new StockOrder("cl", "m", "car");
             order.advanceStatus();
             order.advanceStatus();
-            order.advanceStatus();
 
             StockOrderTransactions.Work work =
                     new StockOrderTransactions.Work(order, StockOrderTransactions.Action.NONE);
@@ -137,7 +143,7 @@ class ServiceTest {
             when(recoveryService.execute(work)).thenReturn(order);
 
             StockOrder advanced = orderService.advanceOrder(order.getId());
-            assertEquals(StockOrderStatus.PAID, advanced.getStatus());
+            assertEquals(StockOrderStatus.AWAITING_PAYMENT, advanced.getStatus());
             verify(transactions).advance(order.getId());
         }
 
@@ -231,6 +237,8 @@ class ServiceTest {
         private OrderEventProducer eventProducer;
         @Mock
         private StockReservationWorkflowJpaRepository workflowRepository;
+        @Mock
+        private DemoPaymentAttemptJpaRepository paymentRepository;
         @InjectMocks
         private StockOrderTransactions transactions;
 
@@ -251,6 +259,58 @@ class ServiceTest {
             assertEquals(StockOrderStatus.PAID, saved.getStatus());
             verify(orderRepository).findByIdForUpdate(order.getId());
             verify(eventProducer).publishOrderPaid(any());
+        }
+
+        @Test
+        @DisplayName("demo payment блокирует order и workflow, сохраняет PENDING intent")
+        void shouldStartDurableDemoPayment() {
+            StockOrder order = new StockOrder("client", "manager", "car");
+            order.advanceStatus();
+            order.advanceStatus();
+            StockReservationWorkflowJpaEntity workflow = workflow(
+                    order, StockReservationWorkflowState.HELD);
+            UUID key = UUID.randomUUID();
+            when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(workflowRepository.findByOrderIdForUpdate(UUID.fromString(order.getId())))
+                    .thenReturn(Optional.of(workflow));
+            when(workflowRepository.databaseNow()).thenReturn(Instant.parse("2026-10-04T10:00:00Z"));
+            when(paymentRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+            StockOrderTransactions.PaymentWork result = transactions.startDemoPayment(
+                    order.getId(), "client", key, DemoPaymentOutcome.SUCCESS);
+
+            assertEquals(DemoPaymentStatus.PENDING, result.payment().getStatus());
+            assertEquals(StockOrderTransactions.Action.CONFIRM, result.work().action());
+            assertEquals(StockReservationWorkflowState.CONFIRM_PENDING, workflow.getState());
+            InOrder locks = inOrder(orderRepository, workflowRepository, paymentRepository);
+            locks.verify(orderRepository).findByIdForUpdate(order.getId());
+            locks.verify(workflowRepository).findByOrderIdForUpdate(UUID.fromString(order.getId()));
+            locks.verify(paymentRepository).findStockByKeyForUpdate(
+                    UUID.fromString(order.getId()), key);
+        }
+
+        @Test
+        @DisplayName("demo payment replay требует тот же outcome")
+        void shouldRejectChangedOutcomeForSameKey() {
+            StockOrder order = new StockOrder("client", "manager", "car");
+            order.advanceStatus();
+            order.advanceStatus();
+            StockReservationWorkflowJpaEntity workflow = workflow(
+                    order, StockReservationWorkflowState.HELD);
+            UUID key = UUID.randomUUID();
+            DemoPaymentAttemptJpaEntity existing = new DemoPaymentAttemptJpaEntity();
+            existing.setStockOrderId(UUID.fromString(order.getId()));
+            existing.setIdempotencyKey(key);
+            existing.setRequestedOutcome(DemoPaymentOutcome.DECLINE);
+            existing.setStatus(DemoPaymentStatus.DECLINED);
+            when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(workflowRepository.findByOrderIdForUpdate(UUID.fromString(order.getId())))
+                    .thenReturn(Optional.of(workflow));
+            when(paymentRepository.findStockByKeyForUpdate(UUID.fromString(order.getId()), key))
+                    .thenReturn(Optional.of(existing));
+
+            assertThrows(DemoPaymentConflictException.class, () -> transactions.startDemoPayment(
+                    order.getId(), "client", key, DemoPaymentOutcome.SUCCESS));
         }
 
         @Test
@@ -309,6 +369,8 @@ class ServiceTest {
         private OrderEventProducer eventProducer;
         @Mock
         private CustomConfigurationGateway configurationGateway;
+        @Mock
+        private DemoPaymentAttemptJpaRepository paymentRepository;
         @InjectMocks
         private CustomOrderService customOrderService;
 
@@ -354,20 +416,42 @@ class ServiceTest {
         }
 
         @Test
-        @DisplayName("advance до PAID публикует событие в outbox")
+        @DisplayName("успешный demo payment переводит заказ в PAID и публикует outbox")
         void shouldPublishEventOnPaid() {
             CarConfiguration config = new CarConfiguration("model-1");
             config.selectVariant("cat-1", "var-1");
-            CustomOrder order = new CustomOrder("mgr", "cl", "model-1", config, new BigDecimal("3500000"));
+            CustomOrder order = new CustomOrder("cl", "mgr", "model-1", config, new BigDecimal("3500000"));
             order.advanceStatus(null);
             order.advanceStatus(null);
 
             when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
             when(orderRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
+            when(paymentRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
 
-            CustomOrder advanced = customOrderService.advanceOrder(order.getId());
-            assertEquals(CustomOrderStatus.PAID, advanced.getStatus());
+            DemoPaymentAttemptJpaEntity payment = customOrderService.startDemoPayment(
+                    order.getId(), "cl", UUID.randomUUID(), DemoPaymentOutcome.SUCCESS);
+            assertEquals(CustomOrderStatus.PAID, order.getStatus());
+            assertEquals(DemoPaymentStatus.SUCCEEDED, payment.getStatus());
             verify(eventProducer).publishOrderPaid(any());
+        }
+
+        @Test
+        @DisplayName("DECLINE сохраняет receipt и позволяет новую попытку")
+        void shouldRecordDeclineWithoutAdvancingOrder() {
+            CarConfiguration config = new CarConfiguration("model-1");
+            CustomOrder order = new CustomOrder(
+                    "client", "manager", "model-1", config, new BigDecimal("3500000"));
+            order.advanceStatus(null);
+            order.advanceStatus(null);
+            when(orderRepository.findByIdForUpdate(order.getId())).thenReturn(order);
+            when(paymentRepository.saveAndFlush(any())).thenAnswer(inv -> inv.getArgument(0));
+
+            DemoPaymentAttemptJpaEntity payment = customOrderService.startDemoPayment(
+                    order.getId(), "client", UUID.randomUUID(), DemoPaymentOutcome.DECLINE);
+
+            assertEquals(DemoPaymentStatus.DECLINED, payment.getStatus());
+            assertEquals(CustomOrderStatus.AWAITING_PAYMENT, order.getStatus());
+            verify(eventProducer, never()).publishOrderPaid(any());
         }
     }
 
@@ -457,6 +541,95 @@ class ServiceTest {
         void shouldGetByCarId() {
             when(requestRepository.findByCarId("car1")).thenReturn(List.of());
             assertTrue(testDriveService.getRequestsByCarId("car1").isEmpty());
+        }
+
+        @Test
+        @DisplayName("личный список фильтруется по subject")
+        void shouldGetRequestsForClient() {
+            when(requestRepository.findByClientId("client-1")).thenReturn(List.of());
+
+            assertTrue(testDriveService.getClientRequests("client-1").isEmpty());
+
+            verify(requestRepository).findByClientId("client-1");
+            verify(requestRepository, never()).findAll();
+        }
+
+        @Test
+        @DisplayName("PENDING можно одобрить только до начала")
+        void shouldApprovePendingRequestBeforeStart() {
+            TestDriveRequest request = requestAt(
+                    LocalDateTime.now(clock).plusMinutes(1), TestDriveStatus.PENDING);
+            when(requestRepository.findByIdForUpdate(request.getId())).thenReturn(request);
+            when(requestRepository.save(request)).thenReturn(request);
+
+            assertEquals(TestDriveStatus.APPROVED,
+                    testDriveService.approveRequest(request.getId()).getStatus());
+
+            verify(requestRepository).findByIdForUpdate(request.getId());
+            verify(requestRepository).save(request);
+        }
+
+        @Test
+        @DisplayName("одобрение на старте отклоняется, повтор APPROVED идемпотентен")
+        void shouldRejectLateApprovalAndKeepApprovalIdempotent() {
+            TestDriveRequest pending = requestAt(LocalDateTime.now(clock), TestDriveStatus.PENDING);
+            when(requestRepository.findByIdForUpdate(pending.getId())).thenReturn(pending);
+
+            assertThrows(TestDriveConflictException.class,
+                    () -> testDriveService.approveRequest(pending.getId()));
+
+            TestDriveRequest approved = requestAt(
+                    LocalDateTime.now(clock).minusHours(1), TestDriveStatus.APPROVED);
+            when(requestRepository.findByIdForUpdate(approved.getId())).thenReturn(approved);
+            assertSame(approved, testDriveService.approveRequest(approved.getId()));
+            verify(requestRepository, never()).save(any());
+        }
+
+        @Test
+        @DisplayName("APPROVED завершается с конца часового слота")
+        void shouldCompleteApprovedRequestAtSlotEnd() {
+            TestDriveRequest request = requestAt(
+                    LocalDateTime.now(clock).minusHours(1), TestDriveStatus.APPROVED);
+            when(requestRepository.findByIdForUpdate(request.getId())).thenReturn(request);
+            when(requestRepository.save(request)).thenReturn(request);
+
+            assertEquals(TestDriveStatus.COMPLETED,
+                    testDriveService.completeRequest(request.getId()).getStatus());
+        }
+
+        @Test
+        @DisplayName("завершение до конца слота отклоняется")
+        void shouldRejectEarlyCompletion() {
+            TestDriveRequest request = requestAt(
+                    LocalDateTime.now(clock).minusMinutes(59), TestDriveStatus.APPROVED);
+            when(requestRepository.findByIdForUpdate(request.getId())).thenReturn(request);
+
+            assertThrows(TestDriveConflictException.class,
+                    () -> testDriveService.completeRequest(request.getId()));
+            verify(requestRepository, never()).save(any());
+        }
+
+        @Test
+        @DisplayName("отмена проверяет владельца после блокировки; сотрудник может отменить чужую")
+        void shouldAuthorizeCancellationOnLockedRequest() {
+            TestDriveRequest foreign = requestAt(
+                    LocalDateTime.now(clock).minusDays(1), TestDriveStatus.PENDING);
+            when(requestRepository.findByIdForUpdate(foreign.getId())).thenReturn(foreign);
+
+            assertThrows(AccessDeniedException.class,
+                    () -> testDriveService.cancelRequest(foreign.getId(), "other-client", false));
+            assertEquals(TestDriveStatus.PENDING, foreign.getStatus());
+            verify(requestRepository, never()).save(any());
+
+            when(requestRepository.save(foreign)).thenReturn(foreign);
+            assertEquals(TestDriveStatus.CANCELLED,
+                    testDriveService.cancelRequest(foreign.getId(), "manager", true).getStatus());
+        }
+
+        private TestDriveRequest requestAt(LocalDateTime scheduledAt, TestDriveStatus status) {
+            return new TestDriveRequest(
+                    UUID.randomUUID().toString(), "owner", UUID.randomUUID().toString(),
+                    scheduledAt, status);
         }
 
         private static final class MutableClock extends Clock {

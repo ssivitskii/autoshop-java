@@ -2,6 +2,7 @@ package dealership.order.core.domain.entity.order;
 
 import dealership.order.core.domain.entity.order.state.stock.CreatedState;
 import dealership.order.core.domain.entity.order.state.stock.OrderState;
+import dealership.order.core.domain.entity.order.state.stock.PaidState;
 import dealership.order.core.domain.enums.StockOrderStatus;
 import dealership.order.core.domain.exception.DomainValidationException;
 import lombok.EqualsAndHashCode;
@@ -49,6 +50,13 @@ public class StockOrder {
 
     public void advanceStatus() {
         state.advance(this);
+    }
+
+    public void markPaid() {
+        if (getStatus() != StockOrderStatus.AWAITING_PAYMENT) {
+            throw new DomainValidationException("Оплату можно зафиксировать только для заказа, ожидающего оплату");
+        }
+        setState(new PaidState());
     }
 
     public void cancel() {
