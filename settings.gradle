@@ -1,4 +1,4 @@
-rootProject.name = 'dealership'
+rootProject.name = 'dealership-api'
 
 include 'common'
 include 'order-service'

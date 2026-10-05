@@ -1,8 +1,8 @@
-# AutoShop Java
+# DealershipAPI
 
-[![CI](https://github.com/ssivitskii/autoshop-java/actions/workflows/ci.yml/badge.svg)](https://github.com/ssivitskii/autoshop-java/actions/workflows/ci.yml)
+[![CI](https://github.com/ssivitskii/dealership-api/actions/workflows/ci.yml/badge.svg)](https://github.com/ssivitskii/dealership-api/actions/workflows/ci.yml)
 
-Учебный backend автосалона на Java: два Spring Boot сервиса управляют каталогом, складом, тест-драйвами и заказами на автомобили в наличии или в выбранной комплектации.
+Backend автосалона на Java с двумя Spring Boot сервисами для каталога, склада, тест-драйвов и заказов автомобилей.
 
 ## Возможности
 

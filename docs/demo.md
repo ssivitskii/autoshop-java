@@ -1,12 +1,12 @@
-# Пятиминутная демонстрация AutoShop
+# Пятиминутная демонстрация DealershipAPI
 
 Сценарий рассчитан примерно на пять минут после того, как Compose завершил первый запуск. Нужны Docker Compose, `curl` и `jq`; прогрев и сборка контейнеров в эти пять минут не входят.
 
 Из свежего клона поднимите полный стек и дождитесь health checks:
 
 ```bash
-git clone https://github.com/ssivitskii/autoshop-java.git
-cd autoshop-java
+git clone https://github.com/ssivitskii/dealership-api.git
+cd dealership-api
 docker compose up --build --wait --wait-timeout 300
 docker compose ps
 ```
