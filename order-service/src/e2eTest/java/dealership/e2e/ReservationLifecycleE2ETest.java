@@ -286,7 +286,7 @@ class ReservationLifecycleE2ETest {
     }
 
     private Process startStorage(String logName) throws IOException {
-        return startJar(root.resolve("storage-service/build/libs/storage-service-1.0-SNAPSHOT.jar"),
+        return startJar(root.resolve("storage-service/build/libs/storage-service-1.0.0.jar"),
                 logs.resolve(logName), List.of(
                         "--server.port=" + storagePort,
                         "--grpc.server.address=127.0.0.1",
@@ -302,7 +302,7 @@ class ReservationLifecycleE2ETest {
     }
 
     private Process startOrder(String logName) throws IOException {
-        return startJar(root.resolve("order-service/build/libs/order-service-1.0-SNAPSHOT.jar"),
+        return startJar(root.resolve("order-service/build/libs/order-service-1.0.0.jar"),
                 logs.resolve(logName), List.of(
                         "--server.port=" + orderPort,
                         "--spring.datasource.url=" + orderDb.getJdbcUrl(),

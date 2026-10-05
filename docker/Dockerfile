@@ -11,7 +11,7 @@ COPY storage-service ./storage-service
 
 RUN test "$SERVICE" = "order-service" || test "$SERVICE" = "storage-service"
 RUN ./gradlew --no-daemon ":${SERVICE}:bootJar" -x test
-RUN cp "${SERVICE}/build/libs/${SERVICE}-1.0-SNAPSHOT.jar" /tmp/application.jar
+RUN cp "${SERVICE}/build/libs/${SERVICE}-1.0.0.jar" /tmp/application.jar
 
 FROM eclipse-temurin:21-jre-jammy
 

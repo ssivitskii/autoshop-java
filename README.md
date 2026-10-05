@@ -25,6 +25,19 @@
 | `storage-service` | Каталог, конфигуратор, склад, заказы на сборку, gRPC-сервер и обработка событий |
 | `common` | Общие Kafka-события и protobuf/gRPC-контракт |
 
+```mermaid
+flowchart LR
+    User[Клиент или сотрудник] -->|JWT / REST| Order[order-service]
+    User -->|JWT / REST| Storage[storage-service]
+    Keycloak[Keycloak] -->|JWT / JWKS| Order
+    Keycloak -->|JWT / JWKS| Storage
+    Order -->|gRPC: каталог и резервы| Storage
+    Order --> OrderDB[(Order PostgreSQL)]
+    Storage --> StorageDB[(Storage PostgreSQL)]
+    Order <-->|order.events / order.responses| Kafka[Kafka]
+    Storage <-->|transactional inbox / outbox| Kafka
+```
+
 Внутри сервисов доменная модель и прикладные сервисы отделены от REST, persistence, messaging и security-адаптеров. У каждого сервиса своя PostgreSQL-база. `order-service` записывает событие заказа в outbox, планировщик отправляет его в `order.events`, а `storage-service` атомарно фиксирует inbox, складской заказ и ответный outbox. Ответ из `order.responses` также применяется вместе с inbox в одной транзакции БД заказов.
 
 Каждое новое Kafka-сообщение имеет envelope версии 1: `eventId`, `eventType`, `version`, `aggregateId`, `traceId` и объект `payload`. ID равен UUID строки outbox и остаётся тем же при каждом повторе. Consumers проверяют версию, тип, обязательные поля и совпадение Kafka key с `aggregateId` и `payload.orderId`. Старые JSON-события без envelope всё ещё принимаются; для них вычисляется стабильный UUID из topic, типа и ID заказа.
@@ -63,7 +76,11 @@ Stock-заказ с `SUCCESS` сначала атомарно сохраняет
 docker compose up --build --wait
 ```
 
-Compose собирает оба приложения, запускает PostgreSQL, Keycloak, ZooKeeper и Kafka, ждёт health checks и затем поднимает сервисы. Состояние можно посмотреть командой `docker compose ps`, логи — `docker compose logs -f`. Остановка с удалением локальных данных:
+Compose собирает оба приложения, запускает PostgreSQL, Keycloak, ZooKeeper и Kafka, ждёт health checks и затем поднимает сервисы. Состояние можно посмотреть командой `docker compose ps`, логи — `docker compose logs -f`.
+
+После первого запуска пройдите [пятиминутный demo-сценарий](docs/demo.md): в нём есть готовые команды для тест-драйва, заказа автомобиля и идемпотентной demo-оплаты.
+
+Остановка с удалением локальных данных:
 
 ```bash
 docker compose down --volumes
